@@ -230,7 +230,7 @@ const KINDS = ['soft', 'learn', 'build', 'other'];
 /** 软类一天最多几次——不是禁止，是不许占满一整天 */
 const SOFT_MAX_PER_DAY = 60;
 
-const SOFT_HINT = /软|歪|怪话|纸条|萌|糯|甜|毛绒|猫|诗/;
+const SOFT_HINT = /软|歪|怪话|纸条|萌|糯|甜|毛绒|诗/;
 const LEARN_HINT = /读|学|研究|弄懂|搞懂|弄清|搞清|手册|文档|笔记|原理|算法|语法|复习|练习|教程|用法/;
 const BUILD_HINT = /写|建|搭|造|做|整理|脚本|工具|页面|代码|程序|目录|网页|统计|图表/;
 
@@ -674,9 +674,15 @@ export default {
         : promise
           ? `【系统提醒，不是${name}说的话】你答应过${name}的事：${topic}。现在去找${name}，用你自己的口气，一两句，像顺口提起来；别解释为什么来找、别说"我今天的安排"。${factLine}`
           : `【系统提醒，不是${name}说的话】你自己待着的时候想起来想跟${name}说：${topic}。用你自己的口气说一两句，像顺口提起来；别解释为什么来找、别提"计划/安排"这类词；没有真实的东西可说、或者觉得这会儿不合适，就只回 [沉默]。${factLine}`;
+      const beforeOutAt = Math.max(Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0, lastOut.get(chatId) || 0);
       await h.pushToSession({ chatId, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: prompt }], '');
-      if (!promise) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
-      return { ok: true, note: `去找主人说：${clip(what, 40)}` };
+      if (typeof h.waitDelivery === 'function') await h.waitDelivery(chatId).catch(() => {});
+      const afterOutAt = Math.max(Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0, lastOut.get(chatId) || 0);
+      const delivered = typeof h.waitDelivery === 'function' ? afterOutAt > beforeOutAt : true;
+      if (!promise && delivered) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
+      return delivered
+        ? { ok: true, note: `去找主人说：${clip(what, 40)}` }
+        : { ok: false, later: true, note: `想找主人聊「${clip(what, 30)}」，但最后没开口（沉默）` };
     }
 
     /** 刚刷完 B 站：从记忆里把这一轮看过的视频捞回来（bili.run 只回数量，没有标题） */
@@ -1341,8 +1347,7 @@ export default {
         if (mem && typeof mem.addEvent === 'function' && st.story) mem.addEvent({ text: clip(`去了${p.name}：${st.story}`, 140), tags: ['自主生活', '生活', '出门'], importance: 0.4 });
       } catch (error) {}
       s.lastOuting = { day: dayKey(), name: p.name, kind: p.kind, photoFile: o.photoFile, photoWhat: st.photoWhat, photoOk: st.photoOk, story: st.story, backAt: Date.now() };
-      // 模型说想分享也只有四成真发：一天出门三次，不能次次都甩照片
-      if (st.share && o.photoFile && !s.pendingShare && Math.random() < 0.4) {
+      if (st.share && o.photoFile && !s.pendingShare) {
         s.pendingShare = { at: Date.now(), file: o.photoFile, place: p.name, what: st.photoWhat || '这家店', story: st.story };
       }
       appendLog({ at: Date.now(), action: 'outing-back', why: o.wish, detail: p.name, note });
@@ -1822,7 +1827,7 @@ export default {
         '怎么排：',
         `- 吃饭另算（见下面），除此之外排 4~6 件你自己的事，按上午 / 下午 / 晚上 / 深夜分，不写几点。现在是${SLOT_LABEL[slotOf(hour)]}，已经过去的时段别排；起得晚、剩下的时段少，就按比例少排。`,
         '- 这几件别都是一类：窝着看东西、上网查点什么、动手做点什么、出门走走、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
-        `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话。`,
+        `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话，平常天气只是背景也不算由头（真要下雨或明显降温提醒带伞添衣才算）。`,
         '- 不用每个时段都塞满，留点空。心情不好可以少排，想偷懒也行。',
         '- 吃饭单独排、不占上面的名额（还没过的那几顿，按你自己的习惯）：action 起个名字比如「吃午饭」，what 写吃什么（像平常过日子，具体点，别太丰盛），time 写大概几点。到点就当你在吃，这段时间别人找你会晚点回。别的有固定时间的事（午睡、洗澡）也可以写 time，没有就不写。',
         '',
@@ -1942,9 +1947,14 @@ export default {
         save(s);
       }
 
-      const recent = (s.done || [])
-        .slice(0, 5)
-        .map((x) => `${clock(x.at)} ${x.action}${x.dry ? '（只是想了想，没动手）' : ''}：${x.note || ''}`);
+      const nowMs = Date.now();
+      const agoLabel = (t) => {
+        const mins = Math.max(1, Math.round((nowMs - Number(t || 0)) / 60_000));
+        return mins >= 60 ? `${Math.floor(mins / 60)}小时${mins % 60 ? (mins % 60) + '分' : ''}前` : `${mins}分钟前`;
+      };
+      const recent3h = (s.done || []).filter((x) => nowMs - (Number(x.at) || 0) <= 3 * 3600_000).slice(0, 8);
+      const recentList = recent3h.length ? recent3h : (s.done || []).slice(0, 5);
+      const recent = recentList.map((x) => `${clock(x.at)}（${agoLabel(x.at)}）${x.action}${x.dry ? '（只是想了想，没动手）' : ''}：${x.note || ''}`);
       // 今天做够数的动作：从「可以接着做」的菜单里撤掉，免得它们反复出现在眼前被顺手选中
       const usedUp = usedUpToday(s);
       // 今天各类做了几次：软的自娱自乐不能占满一整天
@@ -2006,7 +2016,9 @@ export default {
             ? `你已经连着 ${s.project.times} 次在「${s.project.name}」了（${clip(s.project.lastNote, 40)}）。这一轮换件不一样的事，别再窝回同一个场景里，换个地方、换种玩法都行。`
             : `你手上在弄：${s.project.name}${s.project.lastNote ? '——上次做到 ' + s.project.lastNote : ''}。能接着做就接着做，别每次都从零开始。`
           : '你现在没有明确在手的东西。可以从记忆里挑一件接着做，也可以开个新的。',
-        recent.length ? `你最近做过：\n${recent.join('\n')}` : '你还没做过什么。',
+        recent.length
+          ? `${recent3h.length ? '最近 3 小时做过' : '你最近做过'}：\n${recent.join('\n')}\n（最近两三个小时刚做过或类似的事，没特别原因就换点新鲜的；真有新理由比如刚聊到，可以接着做）`
+          : '你还没做过什么。',
         usedUp.length ? `【今天已经做够的】${usedUp.join('、')}——今天一次都不许再做了，换一件没做过的。` : '',
         invented.length ? `你自己发明过的活动：${invented.join('、')}——可以接着做，也可以发明新的。` : '',
         memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
@@ -2032,11 +2044,11 @@ export default {
             })(),
         brokenList.length ? `【这些最近老是做不成，今天先别选】${brokenList.join('、')}` : '',
         '下面是你现在能做的事：',
-        `- speak：找${ownerName}说句话——detail 写具体想说什么；安排里有对应的那条就填 agendaId`,
+        `- speak：找${ownerName}说句话——detail 写具体想说什么（平常天气只是背景不算由头，真要下雨提醒带伞、明显降温提醒添衣才算）；安排里有对应的那条就填 agendaId`,
         cantDo(s, 'bili') ? '' : '- bili：去 B 站看看，找点有趣的',
         cantDo(s, 'web') ? '' : '- web：自己上网查点东西——detail 写你想查什么（「最近有什么好看的冷门动画」「番茄炒蛋先放蛋还是先放番茄」），会去搜一下、点开一条看',
         cantDo(s, 'diary') ? '' : `- diary：写一篇只给自己看的日记（一天最多 ${DIARY_MAX_PER_DAY} 篇）——detail 写想写什么`,
-        cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线。上面装的东西你都能用：B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机。**别只盯着 B站刷推荐**——那是最没营养的玩法。多换地方：高德看看地图上的世界、DeepSeek 问点自己真想知道的、在笔记里写两句、翻翻相册，或者打开一个你还没怎么用过的系统应用试试',
+        cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线，上面装了 B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机，按你自己的兴趣打开看看、随手记两句都行',
         cantDo(s, 'draw') ? '' : '- draw：给自己画一张图',
         cantDo(s, 'outing') ? '' : `- outing：出门去附近真实存在的地方（${Object.values(PLACE_KINDS).map((k) => k.label).join('、')}）——detail 写想去哪类地方、去干嘛（「去菜场买点冬笋」「去公园走走」），会挑一家真的店；今天还能出门 ${Math.max(0, OUTING_MAX_PER_DAY - (Number((s.dayCounts || {}).outing) || 0))} 次`,
         thinkAllowed ? '- think：认真想一件让你好奇的事（光想不做，一天别太多）' : '- think：（这一轮关掉了，别选）',
@@ -2158,13 +2170,11 @@ export default {
       }
 
       noteOutcome(s, d.action, !(result.extra && result.extra.ok === false) || !!(result.extra && result.extra.later));
-      // 精力、心情跟着这件事走一点
+      // 精力、心情跟着这件事走一点（只对明确的失败微调，不再固定概率随机加分）
       {
         const okDone = !(result.extra && result.extra.ok === false);
         if (okDone) addEnergy(s, energyDelta(d.action, `${d.action} ${d.detail || ''} ${result.note || ''}`));
         if (!okDone && !(result.extra && result.extra.later) && d.action !== 'speak') moodNudge(-2, `想${clip(d.detail || d.action, 12)}没做成`);
-        else if (okDone && ['bili', 'web', 'draw'].includes(d.action) && Math.random() < 0.5) moodNudge(2, `${clip((result.extra && result.extra.life ? result.note : '') || d.detail || d.action, 14)}`);
-        else if (okDone && result.extra && result.extra.life && Math.random() < 0.4) moodNudge(1, clip(result.note, 14));
       }
       // 安排里那条：做成了就勾掉；没做成留着，记一下卡在哪
       if (item && !['think', 'rest', 'idle'].includes(d.action)) {
@@ -2197,13 +2207,9 @@ export default {
       if (awayMin > 0) delay = Math.max(delay, awayMin + 3);
       s.wakes += 1;
       s.thinkToday = (Number(s.thinkToday) || 0) + (dry ? 1 : 0);
-      // 连续性：连续做同一件事就把它当成「手上在弄的项目」，下次提示词会催她接着做。
-      // 上一件已经做了 2 次以上的，不随手丢掉——留着让她自己决定要不要换。
-      if (!dry && !resting) {
+      // 连续性：只统计真正连续做的当前活动；换去做别的事后立刻更新，避免旧项目卡一整天。
+      if (!dry && !resting && d.action !== 'idle' && d.action !== 'speak') {
         const sameAsBefore = s.project && s.project.name === d.action;
-        // 旧项目今天已经做够了（翻软家底做过十几次那种），就别再当「手上在弄的事」——
-        // 否则提示词每轮都拿它当锚，她换多少次动作都会绕回来。
-        const projUsedUp = !!(s.project && s.project.name && timesToday(s, s.project.name) >= ACTION_MAX_PER_DAY);
         if (sameAsBefore) {
           s.project = {
             name: d.action,
@@ -2211,7 +2217,7 @@ export default {
             lastNote: String(result.note || '').slice(0, 80),
             at,
           };
-        } else if (!s.project || projUsedUp || (Number(s.project.times) || 0) < 2) {
+        } else {
           s.project = { name: d.action, times: 1, lastNote: String(result.note || '').slice(0, 80), at };
         }
       }
@@ -2573,15 +2579,23 @@ export default {
       ];
     });
 
-    // 聊天时（只在主人私聊）塞一句：刚才在干嘛、接下来想干嘛。不念整张表
-    api.context(({ chat } = {}) => {
+    // 聊天时把当前背景（时间、天气、在做什么）归拢成一行；不塞「接下来想干嘛」以免打断聊天
+    if (typeof api.context === 'function') api.context(({ chat } = {}) => {
       try {
-        if (!cfg().enabled || !chat || chat.kind !== 'private') return '';
+        if (!cfg().enabled || !chat) return '';
+        const nowStr = `${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}`;
+        if (chat.kind !== 'private') return chat.kind === 'group' ? `【当前时间】${nowStr}` : '';
         const { qq } = ownerOf();
-        if (!qq || String(chat.userId) !== qq) return '';
+        if (!qq || String(chat.userId) !== qq) return `【当前时间】${nowStr}`;
         const s = load();
         const last = (s.done || []).find((x) => !x.dry && !['rest', 'idle', 'speak', 'timer'].includes(x.action));
-        const parts = [statusLine(s.agenda, last, { clockOf: clock, busy: s.busy })];
+        const bg = [`现在 ${nowStr}`];
+        if (s.weather && s.weather.now) {
+          const wNote = weatherNotable(s.weather) ? '（有雨或降温，合适时可顺口提醒带伞/加衣）' : '';
+          bg.push(`天气：${weatherLine(s.weather, { full: true })}${wNote}`);
+        }
+        bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
+        const parts = [`【当前背景（仅作背景知晓，不必刻意提起或报备）】${bg.join('｜')}`];
         if (s.energy && isAwakeHour(cfg())) {
           const v = energyNow(s);
           if (v < 35) parts.push(`【精力】你${energyLabel(v)}，回话会懒一点、短一点（别句句喊困）。`);
@@ -2592,7 +2606,6 @@ export default {
         } else if (s.lastOuting && s.lastOuting.day === dayKey() && s.lastOuting.photoFile && Date.now() - s.lastOuting.backAt < 6 * 3600_000) {
           parts.push(`【出门】你今天去过${s.lastOuting.name}，他想看那儿的样子可以用 outing_photo 发张照片。`);
         }
-        if (s.weather && s.weather.now) parts.push(`【天气】${weatherLine(s.weather, { full: false })}${weatherNotable(s.weather) ? '。聊到相关的可以顺口提一句（比如提醒带伞、多穿点），别专门播报' : '。不用主动提'}`);
         return parts.filter(Boolean).join('\n');
       } catch (error) {
         return '';
@@ -2843,10 +2856,25 @@ export default {
           until = now + randMin(2, 10);
           reason = 'busy';
           what = `外面（${s.outing.place.name}）`;
-        } else if (s.busy && s.busy.until > now && Math.random() < 0.85) {
-          until = Math.min(s.busy.until + randMin(1, 5), now + 45 * 60_000);
-          reason = 'busy';
-          what = s.busy.what || '';
+        } else if (s.busy && s.busy.until > now) {
+          if (info.owner) {
+            const handsBusy = /洗澡|泡澡|洗头|洗漱|吃|饭|面|外卖|做菜|下厨|做蛋糕|烤|午睡|午觉|小睡|眯一会|打盹/.test(String(s.busy.what || ''));
+            if (handsBusy) {
+              if (Math.random() >= 0.15) {
+                until = Math.min(s.busy.until, now + randMin(5, 10));
+                reason = 'busy';
+                what = s.busy.what || '';
+              }
+            } else if (Math.random() >= 0.35) {
+              until = Math.min(s.busy.until, now + randMin(1, 3));
+              reason = 'busy';
+              what = s.busy.what || '';
+            }
+          } else if (Math.random() < 0.85) {
+            until = Math.min(s.busy.until + randMin(1, 5), now + 45 * 60_000);
+            reason = 'busy';
+            what = s.busy.what || '';
+          }
         } else if (Math.random() < 0.2) {
           until = now + randMin(1, 4);
           reason = 'away';
@@ -2948,15 +2976,15 @@ export default {
         const ago = mins >= 90 ? `${clock(h.since)} 发的` : `${mins} 分钟前发的`;
         const head =
           h.woken && h.reason === 'sleep'
-            ? '你本来睡着了，被对方的消息吵醒，迷迷糊糊的、有点起床气，回得短一点'
+            ? '本来睡着了，被消息吵醒（有点犯迷糊）'
             : h.woken
-            ? `对方连着发了好几条 / 看着有点急，你放下手里的事（${h.what || '刚才在忙'}）先回`
+            ? `对方连发了几条或有急事，你放下手里的事（${h.what || '刚才在忙'}）先过来看`
             : h.reason === 'sleep'
-              ? `你刚睡醒才看到这些消息（最早一条是 ${ago}），顺带回一下就好`
+              ? `刚睡醒才看到这些消息（最早一条是 ${ago}）`
               : h.reason === 'busy'
-                ? `你刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
-                : `你刚才没看手机，现在才看到（最早一条是 ${ago}）`;
-        const note = `【系统提示，不是对方说的话】${head}。可以自然带一句刚才在干嘛，别道歉个没完，也不用每次都解释。`;
+                ? `刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
+                : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
+        const note = `【刚才背景（不必刻意报备，直接正常聊就行）】${head}。`;
         return [{ type: 'text', text: note }, ...content];
       } catch (error) {
         return undefined;

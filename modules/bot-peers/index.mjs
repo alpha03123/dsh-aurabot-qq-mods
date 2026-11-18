@@ -22,7 +22,7 @@ export default {
     enabled: false,
     peers: '',
     maxRounds: 3,
-    replyChance: 0.6,
+    replyChance: 0.8,
   },
   settings: [
     { key: 'enabled', label: '启用', type: 'switch' },
@@ -69,8 +69,9 @@ export default {
       } catch (error) {}
       if (n >= cap()) return { reply: false, reason: `和${peer.name}已经来回 ${Math.floor(n / 2)} 轮了，先停` };
       if (decision && decision.reply && decision.mode === 'must') return undefined; // 被点名 / @ / 引用：照常回
-      // 人刚说完、对方接着说的这一条：多半是在回那个人，别插嘴（原来一律 60% 接，主人和对方聊天时她会莫名其妙冒出来）
-      if (n === 1) return { reply: false, reason: `${peer.name}在回别人的话，不插嘴` };
+      // 对方明确 @ 或引用了别人（且没提到她）：单独在回那个人，不插嘴
+      if (n === 1 && (msg.atOthers || msg.replyId)) return { reply: false, reason: `${peer.name}在单独回别人的话，不插嘴` };
+      if (decision && decision.reply) return undefined;
       const chance = Math.max(0, Math.min(1, Number(c.replyChance)));
       if (Math.random() < chance) return { reply: true, mode: 'engaged', reason: `接${peer.name}的话` };
       return { reply: false, reason: `${peer.name}这句先不接` };

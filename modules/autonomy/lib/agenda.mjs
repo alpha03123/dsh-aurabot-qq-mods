@@ -246,20 +246,13 @@ export function agendaBlock(agenda, { hour = new Date().getHours(), timers = [],
   return lines.join('\n');
 }
 
-/** 聊天时塞进上下文的一句：只说刚才在干嘛、接下来想干嘛，不念整张表 */
-export function statusLine(agenda, lastDone, { hour = new Date().getHours(), now = Date.now(), clockOf = fmtClock, busy = null } = {}) {
-  const parts = [];
+/** 聊天时塞进上下文的一句：只说现在或刚才在干嘛，不带「接下来想做什么」以免打断聊天 */
+export function statusLine(_agenda, lastDone, { now = Date.now(), clockOf = fmtClock, busy = null } = {}) {
   const did = lastDone && clip(lastDone.brief || lastDone.note, 30);
   const doing = busy && Number(busy.until) > now && busy.what ? clip(busy.what, 30) : '';
-  if (doing) parts.push(`你这会儿正在${doing}`);
-  else if (did && now - (Number(lastDone.at) || 0) < 3 * 3600_000) parts.push(`刚才（${clockOf(lastDone.at)}）：${did}`);
-  else parts.push('你这会儿自己待着，没在忙什么事——别编自己刚才在看什么、做什么');
-  const cur = slotRank(slotOf(hour));
-  const next = agenda
-    ? agenda.items.find((x) => x.state === 'todo' && slotRank(x.slot) >= cur)
-    : null;
-  if (next) parts.push(`接下来想${next.what}`);
-  return `【你自己今天的事】${parts.join('；')}。聊天时能自然带出来就带，用不着就别提，也别汇报计划。`;
+  if (doing) return `正在${doing}`;
+  if (did && now - (Number(lastDone.at) || 0) < 3 * 3600_000) return `刚才（${clockOf(lastDone.at)}）${did}`;
+  return '自己待着，没在忙什么（别编自己刚才在做什么）';
 }
 
 export function fmtClock(ts) {
@@ -398,10 +391,12 @@ export function weatherLine(w, { full = true } = {}) {
   return head + t + m;
 }
 
-/** 天气值不值得提一嘴（下雨下雪、很冷很热） */
+/** 天气值不值得提一嘴（下雨下雪、明显降温、很冷很热） */
 export function weatherNotable(w) {
   if (!w || !w.now) return false;
-  return isWet(w.now.code) || (w.today && w.today.pop >= 60) || w.now.temp <= 5 || w.now.temp >= 33 || Number(w.now.code) === 45;
+  const cooling = Boolean(w.today && w.tomorrow && (w.today.max - w.tomorrow.max >= 5 || w.today.min - w.tomorrow.min >= 5));
+  const tomorrowWet = Boolean(w.tomorrow && (isWet(w.tomorrow.code) || w.tomorrow.pop >= 60));
+  return isWet(w.now.code) || (w.today && w.today.pop >= 60) || tomorrowWet || cooling || w.now.temp <= 5 || w.now.temp >= 33 || Number(w.now.code) === 45;
 }
 
 // ── 精力 ──────────────────────────────────────────────────────
