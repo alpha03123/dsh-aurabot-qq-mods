@@ -2,7 +2,8 @@
  * 机器人同伴（本地模块，2026-11-17）
  *
  * 同一个群里有好几个 Aurabot 时用：认出对方机器人，让她们可以互相接话、斗嘴，但不会没完没了。
- *   · 对方机器人说话：被点名 / @ / 引用 → 照常回；没点名 → 按「接话概率」决定接不接；
+ *   · 对方机器人说话：被点名 / @ / 引用 → 照常回；
+ *   · 对方紧跟在人后面说的（多半是在回那个人）→ 不插嘴；她们已经互相聊起来了 → 按「接话概率」接；
  *   · 机器人之间连续来回超过 maxRounds 轮（中间没有人说话）就停，有人一开口就重新计；
  *   · 人说话完全不管，原来的兴趣话题插话规则照旧（主人和对方聊到她感兴趣的，她也可能插一句）；
  *   · 群聊上下文里告诉她对方是谁。
@@ -13,7 +14,7 @@
 export default {
   id: 'bot-peers',
   name: '机器人同伴',
-  version: '0.1.0-local',
+  version: '0.2.0-local',
   api: 1,
   description: '同一个群里有好几个 Aurabot 时：认出对方，允许互相接话斗嘴，但机器人之间最多来回几轮就停。',
 
@@ -68,6 +69,8 @@ export default {
       } catch (error) {}
       if (n >= cap()) return { reply: false, reason: `和${peer.name}已经来回 ${Math.floor(n / 2)} 轮了，先停` };
       if (decision && decision.reply && decision.mode === 'must') return undefined; // 被点名 / @ / 引用：照常回
+      // 人刚说完、对方接着说的这一条：多半是在回那个人，别插嘴（原来一律 60% 接，主人和对方聊天时她会莫名其妙冒出来）
+      if (n === 1) return { reply: false, reason: `${peer.name}在回别人的话，不插嘴` };
       const chance = Math.max(0, Math.min(1, Number(c.replyChance)));
       if (Math.random() < chance) return { reply: true, mode: 'engaged', reason: `接${peer.name}的话` };
       return { reply: false, reason: `${peer.name}这句先不接` };
