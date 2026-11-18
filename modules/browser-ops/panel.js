@@ -13,6 +13,7 @@ const DEFAULTS = {
   ownerOnly: true, // 仅主人可用：默认开
   browserPath: '', // 浏览器路径；空 = 自动探测
   windowVisible: false, // 窗口显示在屏幕内：默认关（屏幕外运行）
+  headless: true, // 无头运行：默认开（没有窗口、任务栏没有图标）
   snapshotChars: 3000, // 页面快照字数上限
   navigateTimeoutMs: 15000, // 打开网页超时
   whitelist: '', // 站点白名单（每行一个域名），空 = 不限制
@@ -257,6 +258,7 @@ return function Panel({ settings, save, toast }) {
           btn('关闭浏览器', closeBrowser, 'closeb'))),
     // 运行设置
     swRow('仅主人可用', 'ownerOnly', 'AI 工具只在主人会话里可用（默认开；/browser 命令本来就只认主人）'),
+    swRow('无头运行', 'headless', '默认开：浏览器不建窗口，任务栏也没有图标。要扫码登录网站时先关掉它，再「关闭浏览器」重开'),
     swRow('窗口显示在屏幕内', 'windowVisible', '默认关（屏幕外运行不抢前台）；扫二维码登录时可临时打开'),
     swRow('浏览任务注入指引', 'injectGuides', '执行浏览任务时先注入「主流程总纲 + 场景手册」再给页面快照（默认开）'),
     h(ui.Row, { label: '浏览器路径', hint: '留空自动探测：Edge → Chrome → Chromium；即改即存' },

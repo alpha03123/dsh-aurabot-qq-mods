@@ -1,0 +1,13 @@
+{
+  "id": "bot-peers",
+  "name": "机器人同伴",
+  "version": "0.1.0-local",
+  "description": "同一个群里有好几个 Aurabot 时：认出对方，允许互相接话斗嘴，但机器人之间最多来回几轮就停。",
+  "category": "chat",
+  "author": "local",
+  "license": "MIT",
+  "api": 1,
+  "minPluginVersion": "1.2.0",
+  "requires": [],
+  "capabilities": []
+}

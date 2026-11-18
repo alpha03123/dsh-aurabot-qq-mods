@@ -206,7 +206,9 @@ export function createBrowser({
   stopWaitMs = 3000,
   stderrWaitMs = 250,
   useEgo = () => false, // true = 连 DSH 侧边浏览器（共享 ego 实例），不 spawn 不杀进程
+  headless = () => false, // true = 无头运行：不建窗口，任务栏也没有图标（本地改：2026-11-17）
 } = {}) {
+  let headlessNow = false // 当前这个进程是不是无头起的（设置改了要重启浏览器才生效）
   let cdp = null        // 当前 CDP 连接
   let owned = null      // 我们自己 spawn 出来的浏览器进程记录
   let opening = null    // 进行中的启动 Promise（并发 launch 合并）
@@ -354,6 +356,14 @@ export function createBrowser({
       await c.send('Page.enable')
       await c.send('Runtime.enable')
       await c.send('Accessibility.enable').catch(() => { /* 老内核没有就算了，快照退化走 DOM */ })
+      // 无头内核的 UA 自带 HeadlessChrome，不少站（Bing 也是）会拦：换回普通 Chrome 的写法
+      if (headlessNow) {
+        try {
+          const v = await c.send('Browser.getVersion')
+          const ua = String(v?.userAgent || '')
+          if (/Headless/i.test(ua)) await c.send('Emulation.setUserAgentOverride', { userAgent: ua.replace(/HeadlessChrome/g, 'Chrome') })
+        } catch { /* 改不了 UA 也照样能用 */ }
+      }
       cdp = c
       if (owned && !owned.exited && !owned.terminate) owned.terminate = c // 关闭时先尝试优雅退出
     } catch (error) {
@@ -400,8 +410,10 @@ export function createBrowser({
       check()
       if (hasLock()) throw lockError() // 等端口期间也可能被人占了目录
       check()
-      log?.info?.(`[browser-ops] 启动专用浏览器（来源：${source}），资料目录：${profileDir}`)
+      headlessNow = !!headless()
+      log?.info?.(`[browser-ops] 启动专用浏览器（来源：${source}${headlessNow ? '，无头' : ''}），资料目录：${profileDir}`)
       const child = spawnProcess(bin, [
+        ...(headlessNow ? ['--headless=new'] : []),
         `--user-data-dir=${profileDir}`,
         `--remote-debugging-port=${port}`,
         '--remote-debugging-address=127.0.0.1', // 调试口只听本机，绝不暴露给局域网
@@ -624,6 +636,8 @@ export function createBrowser({
       if (visible) await cdp?.send('Page.bringToFront').catch(() => {})
       return { ok: true, visible: !!visible }
     }
+    if (headlessNow && visible) return { ok: false, visible: false, message: '无头运行没有窗口：要扫码登录，先在面板关掉「无头运行」，再关掉重开浏览器' }
+    if (headlessNow) return { ok: true, visible: false }
     const c = need()
     const { windowId } = await c.send('Browser.getWindowForTarget')
     await c.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } }).catch(() => {})
@@ -674,6 +688,7 @@ export function createBrowser({
       profileDir,
       port: egoPort || owned?.port || 0,
       backend: egoTarget ? 'dsh-sidebar' : (owned ? 'dedicated' : 'none'),
+      headless: !egoTarget && !!owned && headlessNow,
       pid: owned?.child?.pid || 0,
       lastError,
       retryAt,

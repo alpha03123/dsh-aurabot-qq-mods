@@ -32,6 +32,7 @@ export default {
     ownerOnly: true,       // 默认仅主人：AI 工具只在主人会话里可用
     browserPath: '',       // 浏览器可执行文件路径；空 = 自动探测（Edge 优先，再 Chrome/Chromium）
     windowVisible: false,  // 默认窗口放屏幕外（不抢前台）；登录扫码时可临时挪进来
+    headless: true,        // 本地改：默认无头运行（没有窗口、任务栏没有图标）；扫码登录时在面板关掉
     snapshotChars: 3000,   // 页面快照最大字符数
     navigateTimeoutMs: 15000, // 打开网页等 load 的上限
     whitelist: '',         // 站点白名单（每行一个域名后缀），空 = 不限制
@@ -52,6 +53,7 @@ export default {
         ownerOnly: s.ownerOnly !== false, // 默认仅主人
         browserPath: String(s.browserPath || ''),
         windowVisible: !!s.windowVisible,
+        headless: s.headless !== false,
         snapshotChars: clampInt(s.snapshotChars, 3000, 500, 8000),
         navigateTimeoutMs: clampInt(s.navigateTimeoutMs, 15000, 3000, 60000),
         whitelist: String(s.whitelist || '').split(/\r?\n/).map((x) => x.trim().toLowerCase()).filter(Boolean),
@@ -62,12 +64,17 @@ export default {
     // 测试钩子（照 pet/phone 模式）：测试注入 fake createBrowser，不打真进程
     const hooks = api.__browserOpsTestHooks || {}
     let browser = null
-    /** 惰性建浏览器句柄：profileDir 等在 setup 时已定，测试可在 hooks 里换实现。 */
-    function getBrowser() {
+    // 本地改（2026-11-17）：闲置自动关闭。每次真用浏览器都记一下时间，闲置超过 10 分钟就关掉，下次要用自动重开
+    const IDLE_CLOSE_MS = 10 * 60_000
+    let lastUse = Date.now()
+    /** 惰性建浏览器句柄：profileDir 等在 setup 时已定，测试可在 hooks 里换实现。touch=false 只看不算「用过」（查状态用）。 */
+    function getBrowser(touch = true) {
+      if (touch) lastUse = Date.now()
       if (!browser) {
         browser = (hooks.createBrowser || createBrowser)({
           profileDir,
           browserPath: () => getSettings().browserPath,
+          headless: () => getSettings().headless,
           log: api.log,
           // 全局开关：连 DSH 侧边浏览器（共享 ego 实例），关着走原来的专用浏览器
           useEgo: () => api.config().browser?.useDshSidebar === true,
@@ -155,7 +162,7 @@ export default {
         execute: async (_args, exec) => {
           const blocked = gate(exec)
           if (blocked) return blocked
-          return { ok: true, message: JSON.stringify(getBrowser().status()) }
+          return { ok: true, message: JSON.stringify(getBrowser(false).status()) }
         },
       }),
     ])
@@ -221,7 +228,7 @@ export default {
     })
 
     // ================= 面板路由（精确匹配，前缀 /aurabot/api/ext/browser-ops）=================
-    api.route('/status', async () => ({ ok: true, ...getBrowser().status(), settings: getSettings() }))
+    api.route('/status', async () => ({ ok: true, ...getBrowser(false).status(), settings: getSettings() }))
     api.route('/open', async () => {
       if (!getSettings().enabled) return { ok: false, error: '总开关没开，请先在面板打开' }
       return getBrowser().launch('面板')
@@ -255,7 +262,18 @@ export default {
     })
 
     // ================= 收尾：模块停下时关掉浏览器 =================
-    api.onDispose(() => { getBrowser().close().catch(() => { /* 收尾尽力而为 */ }) })
+    api.onDispose(() => { getBrowser(false).close().catch(() => { /* 收尾尽力而为 */ }) })
+
+    // 闲置自动关闭：只管自己起的专用浏览器；DSH 侧边浏览器是共享的，不碰
+    api.every(60_000, async () => {
+      if (!browser) return
+      const st = browser.status()
+      if (!st.connected || st.backend !== 'dedicated') return
+      const idle = Date.now() - lastUse
+      if (idle < IDLE_CLOSE_MS) return
+      api.log.info(`[browser-ops] 闲置 ${Math.round(idle / 60_000)} 分钟，先关掉浏览器（下次要用会自动重开）`)
+      await browser.close().catch((error) => api.log.warn('[browser-ops] 闲置关闭失败：' + error.message))
+    }, '浏览器闲置关闭')
 
     // ================= 跨模块 API 面（api.use('browser-ops') 拿到的对象）=================
     // 契约：全部原子操作；总开关关着时 launch 拒绝启动（其余操作会报「没连接」）。
@@ -266,7 +284,7 @@ export default {
       /** 关闭浏览器（优雅退出优先）。 */
       close: () => getBrowser().close(),
       /** 连接状态。 */
-      status: () => getBrowser().status(),
+      status: () => getBrowser(false).status(),
       /** 打开网址等加载完成 → { ok, url, title }。过站点白名单。 */
       navigate: (url, timeoutMs = 0) => {
         const cu = checkUrl(url)
