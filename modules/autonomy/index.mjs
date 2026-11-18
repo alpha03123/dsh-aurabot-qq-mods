@@ -524,8 +524,9 @@ export default {
     /** 从记忆库里挑几条跟她自己有关的，让每次醒来能接上之前的事 */
     function recallHints(limit = 6) {
       try {
-        const raw = readJson(path.join(aurabotDir, 'memories.json'), []);
-        const list = Array.isArray(raw) ? raw : Array.isArray(raw && raw.items) ? raw.items : [];
+        // 走 memory 模块的接口：记忆库换成 SQLite 后 memories.json 已经不在了
+        const mem = api.use('memory');
+        const list = mem && typeof mem.recentEvents === 'function' ? mem.recentEvents(72, 60) || [] : [];
         return list
           .filter((m) => m && typeof m.text === 'string' && m.text.trim())
           .filter((m) => {
@@ -961,6 +962,39 @@ export default {
       }
     }
     /** 这会儿能不能拿图去找主人（和其他主动找他一样的规矩） */
+    /** 现在能不能主动找主人（不算图片额度）：醒着、总开关开、15 分钟内没聊过、今天还有额度、没被叫闭嘴 */
+    function canReachOwnerNow(s) {
+      const g = api.config() || {};
+      if (!g.enabled || !ownerOf().qq || !isAwakeHour(cfg())) return false;
+      if (Date.now() - lastOwnerContact() < 15 * 60_000) return false;
+      if ((Number(s.agenda.speaks) || 0) >= SPEAK_MAX_PER_DAY) return false;
+      try {
+        if (api.core.mutes && api.core.mutes.muted(`private:${ownerOf().qq}`)) return false;
+      } catch (error) {}
+      return true;
+    }
+
+    /**
+     * 作息只认 autonomy 一份：把醒着窗口写进核心的 speakUp 窗口和群聊静默时段，
+     * 还在读它们的地方（B 站、群聊插话判断等）就和她的作息一致了。
+     */
+    let syncedWindow = '';
+    function syncCoreWindow(c) {
+      const from = Math.max(0, Math.min(23, Math.floor(Number(c.awakeFrom) || 0)));
+      const to = Math.max(1, Math.min(24, Math.floor(Number(c.awakeTo) || 24)));
+      const key = `${from}-${to}`;
+      if (key === syncedWindow) return;
+      const g = api.config() || {};
+      const sp = g.speakUp || {};
+      const q = (g.group && g.group.quietHours) || [];
+      const wantQ = [to % 24, from];
+      if (sp.awakeFrom !== from || sp.awakeTo !== to || q[0] !== wantQ[0] || q[1] !== wantQ[1]) {
+        api.setConfig({ speakUp: { awakeFrom: from, awakeTo: to }, group: { quietHours: wantQ } });
+        api.log.info(`自主生活：作息同步到核心（醒着 ${from}–${to} 点，群聊静默 ${wantQ[0]}–${wantQ[1]} 点）`);
+      }
+      syncedWindow = key;
+    }
+
     function canShareImage(s) {
       const g = api.config() || {};
       if (!g.enabled || !ownerOf().qq || !isAwakeHour(cfg())) return false;
@@ -1485,15 +1519,8 @@ export default {
         // 带着具体话题去开口：安排里那条的内容优先，其次是这轮决策写的 detail
         const item = d.agendaId ? s.agenda.items.find((x) => x.id === d.agendaId) : null;
         const what = (item && item.what) || d.detail || d.why;
-        if (!what) {
-          // 没话题就退回老路：交给主动搭话随机挑个由头
-          const su = api.use('speakup');
-          if (su && typeof su.fire === 'function') {
-            await su.fire('自主生活');
-            return { note: '主动找了主人', extra: {} };
-          }
-          return { note: '想找你说话，但主动搭话没开着', extra: { ok: false } };
-        }
+        // 没具体话题就不找：主动找主人只走 autonomy 自己这一条路
+        if (!what) return { note: '想找你说话，但没想好说什么，就算了', extra: { ok: false } };
         const r = await reachOwner(s, { what, why: item ? item.why : '', promise: !!(item && item.from === 'promise') });
         return { note: r.note, extra: { ok: r.ok, later: !!r.later } };
       }
@@ -1502,7 +1529,9 @@ export default {
         const b = api.use('bili');
         if (b && typeof b.run === 'function') {
           const startAt = Date.now() - 5_000;
-          const r = await b.run({ force: true });
+          const allowShare = canReachOwnerNow(s);
+          const r = await b.run({ force: true, allowShare });
+          if (r && Number(r.shared) + Number(r.shots || 0) > 0) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
           const seen = r && r.ok ? seenSince(startAt) : [];
           const base = (r && r.message) || '去 B 站看了看';
           return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: !!(r && r.ok) } };
@@ -2261,6 +2290,11 @@ export default {
     api.every(60_000, async () => {
       const c = cfg();
       if (!c.enabled) return;
+      try {
+        syncCoreWindow(c);
+      } catch (error) {
+        api.log.warn('自主生活：同步作息出错 ' + error.message);
+      }
       if (waking) return; // 上一轮还没结束，这一分钟的 tick 直接跳过
       const s = load();
       try {
@@ -2315,7 +2349,8 @@ export default {
         s.lastSeenAt = Date.now();
         save(s);
       }
-      const due = (s.timers || []).find((t) => !t.fired && t.at <= Date.now());
+      // 睡着时到点的提醒先不发，等醒了按「那会儿你不在、现在才想起来」补
+      const due = isAwakeHour(c) ? (s.timers || []).find((t) => !t.fired && t.at <= Date.now()) : null;
       if (due) {
         due.fired = true;
         save(s);
@@ -2749,7 +2784,7 @@ export default {
     }
     const isAsleep = () => {
       const c = cfg();
-      return !!c.enabled && c.delayReplies !== false && !isAwakeHour(c);
+      return !!c.enabled && !isAwakeHour(c);
     };
 
     api.on('reply/hold', (ms, info) => {
