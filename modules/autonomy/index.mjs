@@ -611,7 +611,7 @@ export default {
     const hub = () => (api.core && api.core.hub) || null;
     const ownerOf = () => {
       const g = api.config() || {};
-      return { qq: String(g.ownerQQ || ''), name: String(g.ownerName || '主人') };
+      return { qq: String(g.ownerId || g.ownerQQ || ''), name: String(g.ownerName || '主人') };
     };
     const ymd = (ts) => {
       const d = new Date(ts);
