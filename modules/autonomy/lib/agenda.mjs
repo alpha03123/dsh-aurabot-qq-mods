@@ -391,12 +391,13 @@ export function weatherLine(w, { full = true } = {}) {
   return head + t + m;
 }
 
-/** 天气值不值得提一嘴（下雨下雪、明显降温、很冷很热） */
-export function weatherNotable(w) {
+/** 天气值不值得提一嘴（下雨下雪、明显降温、很冷很热）；晚上 8 点以后今天的降水概率不算数了，只看明天 */
+export function weatherNotable(w, { hour = new Date().getHours() } = {}) {
   if (!w || !w.now) return false;
   const cooling = Boolean(w.today && w.tomorrow && (w.today.max - w.tomorrow.max >= 5 || w.today.min - w.tomorrow.min >= 5));
   const tomorrowWet = Boolean(w.tomorrow && (isWet(w.tomorrow.code) || w.tomorrow.pop >= 60));
-  return isWet(w.now.code) || (w.today && w.today.pop >= 60) || tomorrowWet || cooling || w.now.temp <= 5 || w.now.temp >= 33 || Number(w.now.code) === 45;
+  const todayWet = Boolean(w.today && w.today.pop >= 60 && hour < 20);
+  return isWet(w.now.code) || todayWet || tomorrowWet || cooling || w.now.temp <= 5 || w.now.temp >= 33 || Number(w.now.code) === 45;
 }
 
 // ── 精力 ──────────────────────────────────────────────────────
