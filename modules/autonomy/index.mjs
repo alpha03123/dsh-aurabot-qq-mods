@@ -44,9 +44,10 @@ import {
   parseJsonLoose,
   parseWhen,
   busyMinutes,
+  selfReport,
+  NOT_BUSY_ACTIONS,
   parseWeather,
   weatherLine,
-  weatherNotable,
   isWet,
   energyAt,
   energyLabel,
@@ -340,6 +341,8 @@ export function parseDecision(out) {
     // 今天安排：这次在做哪一条、顺手怎么改表（解析失败走正则兜底时没有这两样，不影响动作本身）
     agendaId: /^a\d{1,3}$/.test(String(j.agendaId || '').trim()) ? String(j.agendaId).trim() : '',
     ops: Array.isArray(j.ops) ? j.ops.filter((o) => o && typeof o === 'object').slice(0, 3) : [],
+    // 这件事本身：要忙多久、中途能不能放下、做完精力怎么变（她自己报，没写就是 null）
+    ...selfReport(j),
   };
 }
 
@@ -461,7 +464,7 @@ export default {
       key: 'delayReplies',
       label: '忙的时候晚点回',
       type: 'switch',
-      hint: '她在吃饭、刷 B 站、画画时，或者不在活跃时段（睡着了）时，私聊消息晚一会儿 / 等醒了再回，期间的消息会攒在一起。正聊着、对方说急事时照常回。需要插件版本带 reply/hold 事件。',
+      hint: '她在忙或出门时来了私聊，由她自己判断现在回还是过一会儿再看；不在活跃时段（睡着了）时等醒了再回。期间的消息会攒在一起，正聊着时照常回。需要插件版本带 reply/hold 事件。',
     },
     {
       key: 'allowNewMod',
@@ -1834,7 +1837,7 @@ export default {
         '',
         y && (y.items.length || y.done.length) ? '先用你自己的口气说一两句昨天过得怎么样，没做成的也照实说，然后排今天。' : '',
         '只输出 JSON：',
-        '{"yesterday":"一两句，昨天过得怎么样（没有昨天就空着）","theme":"今天大概想怎么过，一句话","items":[{"slot":"morning/afternoon/evening/night","what":"具体想做的事，20 字以内","why":"为什么想做，一句","action":"bili/draw/diary/phone/speak 之一，或你自己起的短名字","time":"可选，比如 12:10"}]}',
+        '{"yesterday":"一两句，昨天过得怎么样（没有昨天就空着）","theme":"今天大概想怎么过，一句话","items":[{"slot":"morning/afternoon/evening/night","what":"具体想做的事，20 字以内","why":"为什么想做，一句","action":"bili/draw/diary/phone/speak 之一，或你自己起的短名字","time":"可选，比如 12:10","busyMin":"写了 time 才填：大概占多少分钟","canPause":"写了 time 才填：这段时间有人找你能不能放下先回，true/false","energy":"写了 time 才填：做完精力怎么变，-10 到 +25"}]}',
       ]
         .filter((x) => x !== '')
         .join('\n');
@@ -1888,7 +1891,7 @@ export default {
         }
         const slot = at ? slotOf(new Date(at).getHours()) : it.slot;
         if (!at && slotPassed(slot, hour)) continue; // 没写时间、又排到已经过去的时段：丢掉
-        const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at }, { hour });
+        const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at, ...(at ? selfReport(it) : {}) }, { hour });
         if (r.ok) added.push(r.item);
       }
       const recap = clip(j.yesterday, 120);
@@ -2057,8 +2060,9 @@ export default {
         `- 生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……自己起个短名字当 action，detail 写清楚做了什么（「楼下面馆吃了碗牛肉面」）。这些算你真的过了这一段，之后聊天能提起来。${cantDo(s, 'outing') ? '' : '要出门去具体的店、公园就用 outing，会挑附近真的地方。'}`,
         '',
         '只回一个 JSON：',
-        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","ops":[],"nextMinutes":45}',
+        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
         'nextMinutes 是你想大概多久后再醒（分钟）：这件事要做很久就写长点，只是歇一下就写短点，不确定就写 0。',
+        'busyMin / canPause / energy 说的是这件事本身，按你自己的情况填：busyMin 大概要占你多少分钟（不占手就 0）；canPause 这期间有人找你，能不能随手放下先回（true / false）；energy 做完精力大概怎么变（-10 到 +25 的整数，回血就正，累人就负）。',
         replansLeft > 0
           ? [
               'ops 是对今天安排的改动，没变化就给空数组，最多 3 条：',
@@ -2174,7 +2178,7 @@ export default {
       // 精力、心情跟着这件事走一点（只对明确的失败微调，不再固定概率随机加分）
       {
         const okDone = !(result.extra && result.extra.ok === false);
-        if (okDone) addEnergy(s, energyDelta(d.action, `${d.action} ${d.detail || ''} ${result.note || ''}`));
+        if (okDone) addEnergy(s, d.energy != null ? d.energy : item && item.energy != null ? item.energy : energyDelta(d.action));
         if (!okDone && !(result.extra && result.extra.later) && d.action !== 'speak') moodNudge(-2, `想${clip(d.detail || d.action, 12)}没做成`);
       }
       // 安排里那条：做成了就勾掉；没做成留着，记一下卡在哪
@@ -2260,8 +2264,11 @@ export default {
       s.dayCounts[d.action] = (Number(s.dayCounts[d.action]) || 0) + 1;
       // 这件事要忙一阵：这期间来私聊会晚点回（reply/hold）
       if (!(result.extra && result.extra.ok === false)) {
-        const mins = Number(result.extra && result.extra.busyMin) || busyMinutes(d.action, `${d.action} ${d.detail || ''} ${result.note || ''}`);
-        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24) };
+        // 出门这种有真实耗时的按真实的算；别的听她自己报的，没报才按动作类型给个大概
+        const own = d.busyMin != null ? d.busyMin : item && item.busyMin != null ? item.busyMin : null;
+        const mins = NOT_BUSY_ACTIONS.includes(d.action) ? 0 : Number(result.extra && result.extra.busyMin) || (own != null ? own : busyMinutes(d.action));
+        const canPause = d.canPause != null ? d.canPause : item && item.canPause != null ? item.canPause : null;
+        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause };
       }
       s.done = [
         { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', ...(item ? { agendaId: item.id } : {}) },
@@ -2591,10 +2598,7 @@ export default {
         const s = load();
         const last = (s.done || []).find((x) => !x.dry && !['rest', 'idle', 'speak', 'timer'].includes(x.action));
         const bg = [`现在 ${nowStr}`];
-        if (s.weather && s.weather.now) {
-          const wNote = weatherNotable(s.weather) ? '（有雨或降温，合适时可顺口提醒带伞/加衣）' : '';
-          bg.push(`天气：${weatherLine(s.weather, { full: true })}${wNote}`);
-        }
+        if (s.weather && s.weather.now) bg.push(`天气：${weatherLine(s.weather, { full: true })}`);
         bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
         const parts = [`【当前背景（仅作背景知晓，不必刻意提起或报备）】${bg.join('｜')}`];
         if (s.energy && isAwakeHour(cfg())) {
@@ -2750,12 +2754,12 @@ export default {
         if (!s.nextWakeAt || s.nextWakeAt > now + 2 * 60_000) s.nextWakeAt = now;
         return true;
       }
-      const mins = busyMinutes(item.action || 'life', `${item.action} ${item.what}`);
+      const mins = item.busyMin != null ? item.busyMin : busyMinutes(item.action || 'life');
       item.state = 'done';
       item.note = item.what;
       item.doneAt = now;
-      s.busy = { since: now, until: now + mins * 60_000, what: item.what };
-      addEnergy(s, energyDelta(item.action || 'life', `${item.action} ${item.what}`));
+      s.busy = { since: now, until: now + mins * 60_000, what: item.what, canPause: item.canPause != null ? item.canPause : null };
+      addEnergy(s, item.energy != null ? item.energy : energyDelta(item.action || 'life'));
       if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
       s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id }, ...(s.done || [])].slice(0, 50);
       try {
@@ -2801,7 +2805,84 @@ export default {
       return !!c.enabled && !isAwakeHour(c);
     };
 
-    api.on('reply/hold', (ms, info) => {
+    // ── 她在忙 / 在外面时来了私聊：问小脑这会儿回不回 ────────────────────────
+    // 同一个聊天几秒内连发的几条合并成一次判断：第一条开一个短窗口，窗口里来的攒进同一批，
+    // 窗口结束只问一次；判断还没回来时又来的，直接等同一个结果（核心是逐条 await hold 的，不合并会并发问好几次）。
+    const JUDGE_GATHER_MS = 2500;
+    const JUDGE_MAX_PER_HOLD = 3; // 一次晚回里最多问几次小脑（第一次 + 之后又来消息再看一眼）
+    const judging = new Map(); // chatId → { id, texts, closed, promise }
+    let judgeSeq = 0;
+    /** 当前人格卡：名字 + 一小段简介，让小脑按她自己的性子判断 */
+    function personaBrief() {
+      try {
+        const c = readJson(configFile, {});
+        const id = (c && c.persona && c.persona.current) || '';
+        if (!id) return { name: '', brief: '' };
+        const raw = fs.readFileSync(path.join(aurabotDir, 'personas', id + '.md'), 'utf8');
+        const fm = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n?/);
+        const name = fm ? ((fm[1].match(/^name:\s*(.+)$/m) || [])[1] || '').trim().replace(/^['"]|['"]$/g, '') : '';
+        return { name, brief: clip((fm ? raw.slice(fm[0].length) : raw).replace(/\s+/g, ' ').trim(), 500) };
+      } catch (error) {
+        return { name: '', brief: '' };
+      }
+    }
+    async function askJudge(texts, ctx) {
+      const now = Date.now();
+      const me = personaBrief();
+      const leftMin = Math.max(1, Math.round((ctx.untilAt - now) / 60_000));
+      const doing = ctx.place
+        ? `在外面（${ctx.place}），手机在身上，大概 ${clock(ctx.untilAt)} 回到家`
+        : `正在${ctx.what || '忙自己的事'}，大概 ${clock(ctx.untilAt)} 弄完`;
+      const pause = ctx.canPause === false ? '（你之前说过这件事中途放不下）' : ctx.canPause === true ? '（你之前说过这件事随时能放下）' : '';
+      const text = [
+        me.brief ? `你的人设：${me.brief}` : '',
+        `现在 ${clock(now)}。你${doing}${pause}。`,
+        `${ctx.who}给你发了私聊：`,
+        ...texts.map((t) => `「${t}」`),
+        ctx.prevUntil ? `（你本来打算 ${clock(ctx.prevUntil)} 再看手机，现在又来了上面这些）` : '',
+        '你会马上拿起手机回，还是先把手上的事弄完、过一会儿再看？按你自己的性子、手上的事和消息内容来定。',
+        `只回 JSON：{"minutes":0,"why":"一句话"} —— minutes 是过几分钟再看（0 = 现在就回，最多 ${leftMin}）。`,
+      ].filter(Boolean).join('\n');
+      try {
+        const out = await ask(api.dsh, { cfg: api.config(), system: `你是${me.name || '一个有自己生活的角色'}，手机响了，决定什么时候看。只输出 JSON。`, text, maxTokens: 200, temperature: 0.7, timeoutMs: 30_000 });
+        const j = parseJsonLoose(out) || {};
+        const m = Number(j.minutes);
+        const minutes = Number.isFinite(m) ? Math.max(0, Math.min(leftMin, 60, Math.round(m))) : 0;
+        api.log.info(`自主生活：${ctx.who}发来私聊（${texts.length} 条），她${minutes ? `打算 ${minutes} 分钟后再看` : '现在就回'}——${clip(j.why || '', 40)}`);
+        return minutes;
+      } catch (error) {
+        api.log.warn('自主生活：问小脑回不回出错，直接回 ' + error.message);
+        return 0;
+      }
+    }
+    /** 合并同一个聊天这几秒来的消息，只问一次；返回 { id, minutes }，同一批拿到同一个 id */
+    function judgeReply(chatId, text, ctx) {
+      let j = judging.get(chatId);
+      if (!j) {
+        j = { id: ++judgeSeq, texts: [], closed: false };
+        const batch = j;
+        batch.promise = new Promise((resolve) => setTimeout(resolve, JUDGE_GATHER_MS))
+          .then(() => {
+            batch.closed = true;
+            return askJudge(batch.texts, ctx);
+          })
+          .then((minutes) => ({ id: batch.id, minutes }))
+          .finally(() => {
+            if (judging.get(chatId) === batch) judging.delete(chatId);
+          });
+        judging.set(chatId, batch);
+      }
+      if (!j.closed && text) j.texts.push(clip(text, 200));
+      return j.promise;
+    }
+    /** 她现在在忙什么（在外面 / 手上有事）；没在忙返回 null */
+    function busyNow(s, now = Date.now()) {
+      if (s.outing && s.outing.returnAt > now) return { untilAt: s.outing.returnAt, place: (s.outing.place && s.outing.place.name) || '外面', what: '', canPause: null };
+      if (s.busy && s.busy.until > now) return { untilAt: s.busy.until, place: '', what: s.busy.what || '', canPause: s.busy.canPause != null ? s.busy.canPause : null };
+      return null;
+    }
+
+    api.on('reply/hold', async (ms, info) => {
       try {
         const c = cfg();
         if (!c.enabled || c.delayReplies === false || !info || !info.chatId) return undefined;
@@ -2823,6 +2904,28 @@ export default {
             }
             save(s);
             return Math.max(0, info.heldUntil - now);
+          }
+          if (h.reason === 'busy' && !h.woken) {
+            save(s);
+            const b = busyNow(s, now);
+            if (!b || (Number(h.judged) || 1) >= JUDGE_MAX_PER_HOLD) return Math.max(0, info.heldUntil - now);
+            const who = info.owner ? ownerOf().name : clip(info.nickname || '对方', 16);
+            const r = await judgeReply(info.chatId, info.text, { ...b, who, prevUntil: h.until });
+            // 等判断的这几秒里状态可能被别处改过：重新读再写
+            const s2 = load();
+            const h2 = heldOf(s2)[info.chatId];
+            if (!h2) return 0;
+            if (h2.judgeId !== r.id) {
+              h2.judged = (Number(h2.judged) || 1) + 1;
+              h2.judgeId = r.id;
+            }
+            const t = Date.now();
+            if (t + r.minutes * 60_000 < h2.until) {
+              h2.until = t + r.minutes * 60_000;
+              h2.woken = true;
+            }
+            save(s2);
+            return Math.max(0, h2.until - t);
           }
           if ((isUrgent(info.text) || h.count >= 4) && !h.woken) {
             h.woken = true;
@@ -2849,33 +2952,29 @@ export default {
           }
           until = nextAwakeAt(c, now) + randMin(5, 60);
           reason = 'sleep';
+        } else if (busyNow(s, now)) {
+          // 在外面 / 手上有事：这会儿回不回让小脑定（几秒内连发的合并成一次）
+          const b = busyNow(s, now);
+          const who = info.owner ? ownerOf().name : clip(info.nickname || '对方', 16);
+          const r = await judgeReply(info.chatId, info.text, { ...b, who });
+          if (!r.minutes) return 0;
+          // 等判断的这几秒里状态可能被别处改过（醒来那一轮也在写）：重新读再写；同一批的后几条只把计数加上
+          const s2 = load();
+          const held2 = heldOf(s2);
+          const t = Date.now();
+          const e = held2[info.chatId];
+          if (e && e.judgeId === r.id && e.until > t) {
+            e.count = (Number(e.count) || 1) + 1;
+            save(s2);
+            return e.until - t;
+          }
+          const what2 = b.place ? `外面（${b.place}）` : b.what;
+          held2[info.chatId] = { since: t, until: t + r.minutes * 60_000, reason: 'busy', what: what2, count: 1, judged: 1, judgeId: r.id, userId: String(info.userId || '') };
+          save(s2);
+          api.log.info(`自主生活：${info.chatId} 的消息晚点回（在${what2}，约 ${r.minutes} 分钟后）`);
+          return r.minutes * 60_000;
         } else if (isUrgent(info.text)) {
           return 0;
-        } else if (s.outing && s.outing.returnAt > now) {
-          // 在外面：手机在身上，过几分钟看到就回
-          if (Math.random() < 0.3) return 0;
-          until = now + randMin(2, 10);
-          reason = 'busy';
-          what = `外面（${s.outing.place.name}）`;
-        } else if (s.busy && s.busy.until > now) {
-          if (info.owner) {
-            const handsBusy = /洗澡|泡澡|洗头|洗漱|吃|饭|煮面|面条|外卖|做菜|下厨|做蛋糕|烤|午睡|午觉|小睡|眯一会|打盹/.test(String(s.busy.what || ''));
-            if (handsBusy) {
-              if (Math.random() >= 0.15) {
-                until = Math.min(s.busy.until, now + randMin(5, 10));
-                reason = 'busy';
-                what = s.busy.what || '';
-              }
-            } else if (Math.random() >= 0.35) {
-              until = Math.min(s.busy.until, now + randMin(1, 3));
-              reason = 'busy';
-              what = s.busy.what || '';
-            }
-          } else if (Math.random() < 0.85) {
-            until = Math.min(s.busy.until + randMin(1, 5), now + 45 * 60_000);
-            reason = 'busy';
-            what = s.busy.what || '';
-          }
         } else if (Math.random() < 0.2) {
           until = now + randMin(1, 4);
           reason = 'away';

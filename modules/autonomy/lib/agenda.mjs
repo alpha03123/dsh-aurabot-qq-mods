@@ -85,7 +85,7 @@ const live = (a) => a.items.filter((x) => x.state !== 'dropped');
  * 加一条。返回 { ok, item?, reason? }。
  * 和已有的（没划掉的）太像就不加：后台最常见的毛病就是同一件事换个说法再塞一遍。
  */
-export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0 } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
+export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0, busyMin = null, canPause = null, energy = null } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
   const w = clip(what, 40);
   if (!w) return { ok: false, reason: '没写要做什么' };
   if (agenda.items.length >= MAX_ITEMS) return { ok: false, reason: `今天已经排了 ${MAX_ITEMS} 条，别再加了` };
@@ -103,6 +103,9 @@ export function addItem(agenda, { slot, what, why = '', from = 'self', action = 
     age: Math.max(0, Number(age) || 0),
     addedAt: now,
     ...(at ? { at } : {}),
+    ...(busyMin !== null ? { busyMin } : {}),
+    ...(canPause !== null ? { canPause } : {}),
+    ...(energy !== null ? { energy } : {}),
   };
   agenda.nextId += 1;
   agenda.items.push(item);
@@ -319,23 +322,39 @@ export function parseWhen(timeText, day = 0, { now = Date.now(), defaultHour = 2
   return d.getTime();
 }
 
-/** 做一件事大概要忙多久（分钟），这期间来消息会晚点回。0 = 不算忙 */
-export function busyMinutes(action, text = '', random = Math.random) {
+/** 不占手的动作：做了也不算在忙 */
+export const NOT_BUSY_ACTIONS = ['speak', 'think', 'rest', 'idle', 'timer', 'plan', 'newmod'];
+
+/** 小脑没说要忙多久时的兜底（分钟）：只按动作类型给个大概，不从文字里猜。0 = 不算忙 */
+export function busyMinutes(action, random = Math.random) {
   const r = (lo, hi) => Math.round(lo + random() * (hi - lo));
-  const t = String(text || '');
   if (action === 'bili') return r(10, 20);
   if (action === 'web') return r(8, 15);
   if (action === 'draw') return r(15, 30);
   if (action === 'diary') return r(5, 12);
   if (action === 'phone') return r(10, 20);
   if (action === 'outing') return r(30, 60);
-  if (['speak', 'think', 'rest', 'idle', 'timer', 'plan', 'newmod'].includes(action)) return 0;
-  // 生活里的事（自己起名的动作）
-  if (/午睡|午觉|小睡|眯一会|打盹/.test(t)) return r(30, 60);
-  if (/洗澡|泡澡|洗头/.test(t)) return r(15, 25);
-  if (/吃|饭|面|外卖|做菜|下厨/.test(t)) return r(20, 40);
-  if (/散步|出门|逛|买|超市/.test(t)) return r(20, 45);
+  if (NOT_BUSY_ACTIONS.includes(action)) return 0;
   return r(10, 25);
+}
+
+/**
+ * 小脑选这件事时顺手报的三样（都可以不填，不填就是 null）：
+ *   busyMin  大概要占她多少分钟（0 = 不占手）
+ *   canPause 这期间主人找她，能不能随手放下先回
+ *   energy   做完精力大概怎么变
+ */
+export function selfReport(j) {
+  const o = j && typeof j === 'object' ? j : {};
+  const n = (v) => (v === '' || v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Number(v));
+  const busy = n(o.busyMin);
+  const energy = n(o.energy);
+  const cp = o.canPause === true || o.canPause === 'true' ? true : o.canPause === false || o.canPause === 'false' ? false : null;
+  return {
+    busyMin: busy === null ? null : Math.round(Math.max(0, Math.min(360, busy))),
+    canPause: cp,
+    energy: energy === null ? null : Math.round(Math.max(-15, Math.min(30, energy))),
+  };
 }
 
 /** 对方像是有急事：别再晚回了 */
@@ -391,15 +410,6 @@ export function weatherLine(w, { full = true } = {}) {
   return head + t + m;
 }
 
-/** 天气值不值得提一嘴（下雨下雪、明显降温、很冷很热）；晚上 8 点以后今天的降水概率不算数了，只看明天 */
-export function weatherNotable(w, { hour = new Date().getHours() } = {}) {
-  if (!w || !w.now) return false;
-  const cooling = Boolean(w.today && w.tomorrow && (w.today.max - w.tomorrow.max >= 5 || w.today.min - w.tomorrow.min >= 5));
-  const tomorrowWet = Boolean(w.tomorrow && (isWet(w.tomorrow.code) || w.tomorrow.pop >= 60));
-  const todayWet = Boolean(w.today && w.today.pop >= 60 && hour < 20);
-  return isWet(w.now.code) || todayWet || tomorrowWet || cooling || w.now.temp <= 5 || w.now.temp >= 33 || Number(w.now.code) === 45;
-}
-
 // ── 精力 ──────────────────────────────────────────────────────
 export const ENERGY_DRAIN_PER_HOUR = 4.5;
 export function energyAt(e, now = Date.now()) {
@@ -410,15 +420,10 @@ export function energyAt(e, now = Date.now()) {
 export function energyLabel(v) {
   return v >= 70 ? '精神不错' : v >= 45 ? '还行' : v >= 25 ? '有点累' : '困得不行';
 }
-/** 做完一件事精力怎么变 */
-export function energyDelta(action, text = '') {
-  const t = String(text || '');
+/** 小脑没说精力怎么变时的兜底：只按动作类型，生活里的事不猜，算 0 */
+export function energyDelta(action) {
   if (action === 'rest') return 12;
   if (action === 'outing') return -5;
-  if (/午睡|午觉|小睡|眯一会|打盹/.test(t)) return 25;
-  if (/吃|饭|面|外卖|宵夜|零食|奶茶/.test(t)) return 8;
-  if (/洗澡|泡澡|泡脚/.test(t)) return 5;
   if (['bili', 'web', 'phone', 'draw'].includes(action)) return -3;
-  if (['diary', 'think', 'speak', 'idle', 'timer', 'plan'].includes(action)) return 0;
-  return -2;
+  return 0;
 }

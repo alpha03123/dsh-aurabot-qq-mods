@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { statusLine, weatherNotable } from '../lib/agenda.mjs'
+import { statusLine } from '../lib/agenda.mjs'
 import botPeers from '../../bot-peers/index.mjs'
 
 test('statusLine 不包含「接下来想」，只保留当前/刚才在做什么', () => {
@@ -15,29 +15,6 @@ test('statusLine 不包含「接下来想」，只保留当前/刚才在做什�
   const s2 = statusLine(agenda, null, { hour: 19, busy: { until: Date.now() + 60_000, what: '做蛋糕' } })
   assert.ok(s2.includes('正在做蛋糕'))
   assert.equal(s2.includes('接下来想'), false)
-})
-
-test('weatherNotable 能识别大幅降温与明天高降水概率', () => {
-  const normal = {
-    now: { temp: 18, code: 1 },
-    today: { min: 14, max: 21, pop: 10, code: 1 },
-    tomorrow: { min: 13, max: 20, pop: 10, code: 1 },
-  }
-  assert.equal(weatherNotable(normal), false)
-
-  const cooling = {
-    now: { temp: 16, code: 0 },
-    today: { min: 10, max: 18, pop: 0, code: 0 },
-    tomorrow: { min: 5, max: 11, pop: 10, code: 2 },
-  }
-  assert.equal(weatherNotable(cooling), true)
-
-  const tomorrowRain = {
-    now: { temp: 18, code: 2 },
-    today: { min: 14, max: 20, pop: 20, code: 2 },
-    tomorrow: { min: 13, max: 18, pop: 75, code: 61 },
-  }
-  assert.equal(weatherNotable(tomorrowRain), true)
 })
 
 test('bot-peers：n === 1 仅在单独回别人时拦截，公共发言按意愿/概率放行', () => {
