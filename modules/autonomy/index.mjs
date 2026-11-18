@@ -676,9 +676,10 @@ export default {
           : `【系统提醒，不是${name}说的话】你自己待着的时候想起来想跟${name}说：${topic}。用你自己的口气说一两句，像顺口提起来；别解释为什么来找、别提"计划/安排"这类词；没有真实的东西可说、或者觉得这会儿不合适，就只回 [沉默]。${factLine}`;
       const beforeOutAt = Math.max(Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0, lastOut.get(chatId) || 0);
       await h.pushToSession({ chatId, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: prompt }], '');
-      if (typeof h.waitDelivery === 'function') await h.waitDelivery(chatId).catch(() => {});
+      // pushToSession 只是把话排进队列；等这一轮说完发完再看她开没开口（等太久就按开了口算，额度宁可多扣）
+      const waited = typeof h.waitDelivery === 'function' ? await h.waitDelivery(chatId).catch(() => 'timeout') : 'timeout';
       const afterOutAt = Math.max(Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0, lastOut.get(chatId) || 0);
-      const delivered = typeof h.waitDelivery === 'function' ? afterOutAt > beforeOutAt : true;
+      const delivered = waited === 'timeout' || afterOutAt > beforeOutAt;
       if (!promise && delivered) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
       return delivered
         ? { ok: true, note: `去找主人说：${clip(what, 40)}` }
@@ -2858,7 +2859,7 @@ export default {
           what = `外面（${s.outing.place.name}）`;
         } else if (s.busy && s.busy.until > now) {
           if (info.owner) {
-            const handsBusy = /洗澡|泡澡|洗头|洗漱|吃|饭|面|外卖|做菜|下厨|做蛋糕|烤|午睡|午觉|小睡|眯一会|打盹/.test(String(s.busy.what || ''));
+            const handsBusy = /洗澡|泡澡|洗头|洗漱|吃|饭|煮面|面条|外卖|做菜|下厨|做蛋糕|烤|午睡|午觉|小睡|眯一会|打盹/.test(String(s.busy.what || ''));
             if (handsBusy) {
               if (Math.random() >= 0.15) {
                 until = Math.min(s.busy.until, now + randMin(5, 10));
