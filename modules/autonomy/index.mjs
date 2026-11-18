@@ -9,6 +9,14 @@
  *
  * 所有行为都写进 activity.jsonl（只追加，长期留着），面板里能看到。
  *
+ * 本地改版 0.7.0-local（2026-11-17）：加「今天的安排」——
+ *   · 每天第一次醒来，用 api.think（带人格、记忆）复盘昨天、定今天 3~5 条软安排（只分时段）；
+ *   · 之后每次醒来照着安排挑事做，同一次决策里可以顺手改表（ops），看到的东西、和主人聊的话都能改安排；
+ *   · 答应主人的事（my_agenda 工具）后台不能删不能挪；定了几点的走 timers，到点直接在私聊里叫她开口；
+ *   · speak 不再走 speakup.fire（它的由头是随机抽的），改成带着具体话题推进主人私聊；
+ *   · 聊天时只往上下文塞一句「刚才在干嘛 / 接下来想干嘛」。
+ * 纯逻辑在 lib/agenda.mjs。
+ *
  * @type {import('../aurabot').AurabotModule}
  */
 import fs from 'node:fs';
@@ -17,6 +25,36 @@ import { execFile } from 'node:child_process';
 import { assertNoModelText, checkExec } from './lib/exec-guard.mjs';
 import { scanModuleCode } from './lib/mod-scan.mjs';
 import { grantRows, isGranted, requireGrant } from './lib/grants.mjs';
+import {
+  SLOT_LABEL,
+  slotOf,
+  REPLAN_MAX_PER_DAY,
+  SPEAK_MAX_PER_DAY,
+  addItem,
+  agendaBlock,
+  mergeOwnerEdits,
+  slotPassed,
+  applyOps,
+  carryCandidates,
+  clip,
+  inheritAge,
+  newAgenda,
+  normalizeAgenda,
+  parseClockToday,
+  parseJsonLoose,
+  parseWhen,
+  busyMinutes,
+  parseWeather,
+  weatherLine,
+  weatherNotable,
+  isWet,
+  energyAt,
+  energyLabel,
+  energyDelta,
+  isUrgent,
+  statusLine,
+} from './lib/agenda.mjs';
+import { PLACE_KINDS, pickKind, searchAmap, searchOsm, choosePlace, fmtDistance } from './lib/outing.mjs';
 
 import crypto from 'node:crypto';
 
@@ -25,9 +63,19 @@ import crypto from 'node:crypto';
 // 这里的相对 import 不会被转成 __lib。所以读盘和问模型都自己来，不依赖 core/store.js。
 
 function readJson(file, fallback) {
+  let raw;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    raw = fs.readFileSync(file, 'utf8');
   } catch (error) {
+    return typeof fallback === 'function' ? fallback() : fallback;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    // 本地改：文件写坏了（比如写到一半 DSH 被关）——留一份坏文件再从头来，别悄悄重置看不出原因
+    try {
+      if (raw && raw.trim()) fs.copyFileSync(file, `${file}.bad-${Date.now()}`);
+    } catch (e) {}
     return typeof fallback === 'function' ? fallback() : fallback;
   }
 }
@@ -35,7 +83,10 @@ function readJson(file, fallback) {
 function writeJson(file, data) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+    // 先写临时文件再改名：写到一半被打断也不会留下半截 JSON
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmp, file);
     return true;
   } catch (error) {
     // 以前静默吞掉，导致「状态根本没落盘却看不出来」。留个痕迹方便排查。
@@ -54,12 +105,13 @@ function writeJson(file, data) {
 const ASK_TIMEOUT_MS = 45_000;
 
 /** 问一次宿主模型（不进会话）：后台决策用。超时抛错，由上层降级处理。 */
-async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, timeoutMs = ASK_TIMEOUT_MS }) {
+async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, timeoutMs = ASK_TIMEOUT_MS, cfg = null }) {
   const llm = dsh.llm || (typeof dsh.get === 'function' ? dsh.get('llm') : null);
   if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有 llm 服务');
-  let provider;
-  let model;
-  try {
+  // 本地改（2026-11-17）：先用 Aurabot 里选的模型（和聊天同一个），没选才用 DSH 的默认模型
+  let provider = cfg && cfg.model && cfg.model.provider ? cfg.model.provider : undefined;
+  let model = cfg && cfg.model && cfg.model.model ? cfg.model.model : undefined;
+  if (!provider || !model) try {
     const svc = typeof dsh.get === 'function' ? dsh.get('agentDefaultModel') : null;
     const sel = svc && typeof svc.currentSelection === 'function' ? svc.currentSelection() : null;
     if (sel && sel.provider && sel.model) {
@@ -117,7 +169,9 @@ async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, time
   return result;
 }
 
-const ACTIONS = ['idle', 'speak', 'bili', 'diary', 'phone', 'draw', 'think', 'rest'];
+const ACTIONS = ['idle', 'speak', 'bili', 'web', 'diary', 'phone', 'draw', 'think', 'rest', 'outing'];
+/** 一天最多出门几次 */
+const OUTING_MAX_PER_DAY = 3;
 /** 有专用执行器的动作；不在这里的动作发布版只记录、不执行 */
 const STANDARD_ACTIONS = new Set(ACTIONS);
 
@@ -130,12 +184,14 @@ const THINK_LIMIT_PER_DAY = 2;
  * 机器上每次都"有输出"，所以骗得过一切产出检查——只能靠次数硬拦。
  */
 const ACTION_MAX_PER_DAY = 5;
+/** 同一件事连着做到第几次就不再催「接着做」，改成提醒换一件 */
+const PROJECT_STALE_TIMES = 3;
 
 /**
  * 容器型动作：每次进去做的事都不一样（逛不同的 App、写不同的脚本、画不同的图），
  * 不该被「同一件事一天最多做几次」这条规则算进去。手机要逛 100 次就靠这条放行。
  */
-const REPEATABLE_ACTIONS = new Set(['phone', 'draw', 'bili', 'rest', 'think']);
+const REPEATABLE_ACTIONS = new Set(['phone', 'draw', 'bili', 'web', 'rest', 'think']);
 
 /** 动作名相似到这个程度就算同一件事（翻软家底 ≈ 查软家底） */
 const SAME_ACTION_SIM = 0.6;
@@ -281,6 +337,9 @@ export function parseDecision(out) {
       .replace(/[^a-z]/g, '')
       .slice(0, 10),
     nextMinutes: Math.max(0, Math.min(240, Math.round(Number(j.nextMinutes) || 0))),
+    // 今天安排：这次在做哪一条、顺手怎么改表（解析失败走正则兜底时没有这两样，不影响动作本身）
+    agendaId: /^a\d{1,3}$/.test(String(j.agendaId || '').trim()) ? String(j.agendaId).trim() : '',
+    ops: Array.isArray(j.ops) ? j.ops.filter((o) => o && typeof o === 'object').slice(0, 3) : [],
   };
 }
 
@@ -346,7 +405,7 @@ export function parsePersonaMbti(md) {
 export default {
   id: 'autonomy',
   name: '自主生活',
-  version: '0.6.1',
+  version: '0.7.0-local',
   api: 1,
   description: '她自己决定这一刻做什么、下次什么时候醒；间隔按区间随机并受时段活跃度影响。不执行 shell 命令',
   panel: 'panel.js',
@@ -373,9 +432,37 @@ export default {
     phoneLock: '',
     // 手机每天最多逛几次
     phoneMaxPerDay: 100,
+    // 本地改：她在忙（吃饭、刷 B 站……）或睡着时，私聊晚点回；正聊着、急事不受影响
+    delayReplies: true,
+    // 本地改：天气（Open-Meteo，免费不用 key）。城市写中文名，经纬度留空会自动查一次
+    weatherCity: '宁波',
+    weatherLat: 29.8683,
+    weatherLon: 121.544,
+    // 本地改：出门（真实地点）。家的位置用 WGS84 经纬度；高德 key 没填就只用 OSM
+    outingEnabled: false,
+    homeName: '',
+    homeLat: '',
+    homeLon: '',
+    outingRadius: 2500,
+    amapKey: '',
   },
   settings: [
     { key: 'enabled', label: '启用自主生活', type: 'switch' },
+    { key: 'weatherCity', label: '她住的城市（查天气用）', type: 'text', hint: '写中文城市名，比如 宁波。改了城市就把下面两个经纬度清空，会自动重新查。留空 = 不看天气' },
+    { key: 'weatherLat', label: '纬度（可留空自动查）', type: 'number' },
+    { key: 'weatherLon', label: '经度（可留空自动查）', type: 'number' },
+    { key: 'outingEnabled', label: '允许她出门（去附近真实的店 / 公园）', type: 'switch', hint: '要先填下面「住的地方」的经纬度。地点来自高德（填了 key 时）或 OpenStreetMap；店里的经历由模型按真实店名、距离、天气来写。' },
+    { key: 'homeName', label: '住的地方（给她看的名字，比如「月湖边上」）', type: 'text', hint: '别填真实住址，选一片街区 / 商圈就好——她会在聊天里提到去过的地方' },
+    { key: 'homeLat', label: '住处纬度（WGS84）', type: 'number' },
+    { key: 'homeLon', label: '住处经度（WGS84）', type: 'number' },
+    { key: 'outingRadius', label: '活动半径（米）', type: 'number' },
+    { key: 'amapKey', label: '高德 Web 服务 key（可留空，留空只用 OpenStreetMap）', type: 'password' },
+    {
+      key: 'delayReplies',
+      label: '忙的时候晚点回',
+      type: 'switch',
+      hint: '她在吃饭、刷 B 站、画画时，或者不在活跃时段（睡着了）时，私聊消息晚一会儿 / 等醒了再回，期间的消息会攒在一起。正聊着、对方说急事时照常回。需要插件版本带 reply/hold 事件。',
+    },
     {
       key: 'allowNewMod',
       label: '允许她给自己写新模块',
@@ -467,17 +554,48 @@ export default {
 
     const cfg = () => ({ ...this.defaults, ...(api.settings() || {}) });
 
-    const emptyState = () => ({ day: dayKey(), wakes: 0, nextWakeAt: 0, plan: [], done: [], note: '', customActions: {}, project: null, thinkToday: 0, dayCounts: {} });
+    const emptyState = () => ({ day: dayKey(), wakes: 0, nextWakeAt: 0, plan: [], done: [], note: '', customActions: {}, project: null, thinkToday: 0, dayCounts: {}, agenda: newAgenda(dayKey()), timers: [], yesterday: null });
     function load() {
       const s = readJson(stateFile(), emptyState);
       // 跨天保留：手上在弄的事、以及她发明过的动作——连续性全靠这两个
       const keepProject = s.project;
+      const keepOuting = s.outing && s.outing.returnAt > Date.now() - 6 * 3600_000 ? s.outing : null;
       const keepCustom = s.customActions;
+      const keepFails = { streak: (s.fails && s.fails.streak) || {}, until: (s.fails && s.fails.until) || {} };
+      // 定时提醒跨天有效（「明早八点叫我」），只丢掉响过的和过期一天以上的
+      const keepTimers = (Array.isArray(s.timers) ? s.timers : []).filter((t) => t && !t.fired && t.at > Date.now() - 86_400_000);
       if (s.day !== dayKey()) {
+        // 昨天留个底，早上定计划时复盘用；答应主人还没做的直接带过来
+        const prevAgenda = s.agenda && typeof s.agenda === 'object' ? s.agenda : null;
+        const yesterday = {
+          day: s.day,
+          theme: (prevAgenda && prevAgenda.theme) || '',
+          items: (prevAgenda && Array.isArray(prevAgenda.items) ? prevAgenda.items : []).map((x) => ({ id: x.id, slot: x.slot, what: x.what, from: x.from, state: x.state, note: x.note })),
+          done: (Array.isArray(s.done) ? s.done : []).slice(0, 12).map((x) => ({ at: x.at, action: x.action, note: x.note })),
+          carries: carryCandidates(prevAgenda),
+          // 昨天电脑最后一次开着是几点、睡前那一步走没走：早关机 = 她早睡了
+          lastSeenAt: Number(s.lastSeenAt) || 0,
+          bedtime: s.bedtimeDay === s.day,
+          ymd: (() => {
+            const d = new Date(s.day);
+            return Number.isFinite(d.getTime()) ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` : '';
+          })(),
+        };
         Object.assign(s, emptyState());
         s.project = keepProject || null;
+        s.outing = keepOuting;
         s.customActions = keepCustom && typeof keepCustom === 'object' ? keepCustom : {};
+        s.fails = keepFails;
+        s.yesterday = yesterday;
+        for (const x of yesterday.carries.filter((c) => c.from === 'promise')) {
+          addItem(s.agenda, { slot: x.slot, what: x.what, why: x.why, from: 'promise', action: x.action, age: x.age });
+        }
       }
+      s.agenda = normalizeAgenda(s.agenda, dayKey());
+      s.timers = keepTimers;
+      if (!s.fails || typeof s.fails !== 'object') s.fails = { streak: {}, until: {} };
+      s.fails.streak = s.fails.streak || {};
+      s.fails.until = s.fails.until || {};
       if (!Array.isArray(s.plan)) s.plan = [];
       if (!Array.isArray(s.done)) s.done = [];
       // 当天各动作的累计次数：done 只保留最近 50 条，数额度不能拿它算
@@ -487,6 +605,97 @@ export default {
       return s;
     }
     const save = (s) => writeJson(stateFile(), s);
+
+    // ── 和主人有关的几样：私聊流水、开口 ─────────────────────────
+    const hub = () => (api.core && api.core.hub) || null;
+    const ownerOf = () => {
+      const g = api.config() || {};
+      return { qq: String(g.ownerQQ || ''), name: String(g.ownerName || '主人') };
+    };
+    const ymd = (ts) => {
+      const d = new Date(ts);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+
+    /** 最近和主人的私聊（从聊天流水读，不进她的会话）：since 之后最多 limit 句 */
+    function ownerChatLines(sinceMs, limit = 10) {
+      const h = hub();
+      const { qq, name } = ownerOf();
+      if (!h || typeof h.chatLogOf !== 'function' || !qq) return [];
+      const now = Date.now();
+      const days = ymd(sinceMs) === ymd(now) ? [ymd(now)] : [ymd(sinceMs), ymd(now)];
+      const rows = [];
+      for (const day of days) {
+        for (const r of h.chatLogOf(day) || []) {
+          if (!r || r.chatId !== `private:${qq}` || r.forgottenAt || !(r.t >= sinceMs)) continue;
+          if (r.who === '系统') continue;
+          rows.push(`${fmtHM(r.t)} ${r.who === 'bot' ? '你' : name}：${clip(r.text, 80)}`);
+        }
+      }
+      return rows.slice(-limit);
+    }
+    const fmtHM = (ts) => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+
+    /** 和主人最近一次来往（他说的或她说的） */
+    const lastOwnerContact = () => {
+      const h = hub();
+      return h ? Math.max(Number(h.lastOwnerChatAt) || 0, Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0) : 0;
+    };
+
+    /**
+     * 带着具体话题去主人私聊里开口：推一条系统提醒进她和主人的真实会话，
+     * 由主人格结合聊天上下文决定怎么说、说不说（可以回 [沉默]）。
+     * promise = 答应过主人的事，不受「刚聊过」「一天几次」的限制。
+     */
+    async function reachOwner(s, { what, why = '', promise = false, timed = false, followup = false, lateFrom = 0 }) {
+      const g = api.config() || {};
+      const { qq, name } = ownerOf();
+      const h = hub();
+      if (!g.enabled) return { ok: false, note: '想找主人，但插件总开关关着' };
+      if (!qq || !h || typeof h.pushToSession !== 'function') return { ok: false, note: '想找主人，但找不到私聊会话' };
+      const chatId = `private:${qq}`;
+      try {
+        if (api.core.mutes && api.core.mutes.muted(chatId)) return { ok: false, note: '想找主人，但被他叫闭嘴了' };
+      } catch (error) {}
+      if (!promise) {
+        if (Date.now() - lastOwnerContact() < 15 * 60_000) return { ok: false, later: true, note: '你们刚聊过，先不专门去找' };
+        if ((Number(s.agenda.speaks) || 0) >= SPEAK_MAX_PER_DAY) return { ok: false, note: `今天已经主动找过他 ${s.agenda.speaks} 次了，先不找` };
+      }
+      const topic = clip(what, 80) + (why ? `（${clip(why, 40)}）` : '');
+      // 安排是早上（甚至前一天）写的：开口前给她现在的时间和天气，话题里的「今天/明天」以现在为准
+      const factLine = `（现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}${s.weather && s.weather.now ? '；天气：' + weatherLine(s.weather) : ''}。话题是早些时候想的，跟现在的事实对不上（比如说明天下雨、其实明天是晴天）就改口或者干脆不提。）`;
+      const prompt = timed && lateFrom && !followup
+        ? `【系统提醒，不是${name}说的话】你答应过${name}在 ${fmtHM(lateFrom)} 「${topic}」，可那会儿你不在（睡着了 / 没上线），现在才想起来。用你自己的口气补一句，可以带点不好意思，一两句就好，别提系统。`
+        : followup
+        ? `【系统提醒，不是${name}说的话】你一直惦记着${name}的事：${topic}。现在去问问，用你自己的口气，一两句，像突然想起来顺口一问；别说"我记得你说过""你之前提到"，也别提系统。`
+        : timed
+        ? `【系统提醒，不是${name}说的话】到点了：你答应过${name}「${topic}」。现在就用你自己的口气跟${name}说，一两句就好，别提系统、别说"提醒时间到了"。`
+        : promise
+          ? `【系统提醒，不是${name}说的话】你答应过${name}的事：${topic}。现在去找${name}，用你自己的口气，一两句，像顺口提起来；别解释为什么来找、别说"我今天的安排"。${factLine}`
+          : `【系统提醒，不是${name}说的话】你自己待着的时候想起来想跟${name}说：${topic}。用你自己的口气说一两句，像顺口提起来；别解释为什么来找、别提"计划/安排"这类词；没有真实的东西可说、或者觉得这会儿不合适，就只回 [沉默]。${factLine}`;
+      await h.pushToSession({ chatId, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: prompt }], '');
+      if (!promise) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
+      return { ok: true, note: `去找主人说：${clip(what, 40)}` };
+    }
+
+    /** 刚刷完 B 站：从记忆里把这一轮看过的视频捞回来（bili.run 只回数量，没有标题） */
+    function seenSince(startAt, limit = 4) {
+      try {
+        const mem = api.use('memory');
+        if (!mem || typeof mem.recentEvents !== 'function') return [];
+        return mem
+          .recentEvents(2, 12)
+          .filter((m) => m && m.kind === 'seen' && Number(m.at) >= startAt)
+          .slice(0, limit)
+          .map((m) => {
+            const title = clip(m.meta && m.meta.title, 30);
+            const felt = clip(m.text, 40);
+            return title ? `《${title}》${felt && felt !== title ? '（' + felt + '）' : ''}` : felt;
+          });
+      } catch (error) {
+        return [];
+      }
+    }
 
     /** 只追加的活动流水，长期保留 */
     function appendLog(rec) {
@@ -731,42 +940,588 @@ export default {
       return pick;
     }
 
-    /** 把决策变成真实动作 */
-    async function act(d) {
-      if (d.action === 'speak') {
-        const su = api.use('speakup');
-        if (su && typeof su.fire === 'function') {
-          await su.fire('自己想起来');
-          return { note: '主动找了主人', extra: {} };
+    /**
+     * 自己上网：搜一下 → 自己挑一条点开 → 读完用自己的口气记下看到了什么。
+     * 浏览器用 browser-ops（专用浏览器，窗口在屏幕外），看过的写进记忆（seen，不算人物事实）。
+     */
+    // ── 上网看到有意思的图，先让模型真看一眼，合适才发给主人 ───────────────
+    const IMAGE_SHARE_MAX_PER_DAY = 2;
+    /** 页面上像样的图（够大、http(s)、有说明的排前面），最多 6 张 */
+    async function pageImages(bo) {
+      if (!bo || typeof bo.evaluate !== 'function') return [];
+      try {
+        const raw = await bo.evaluate(`JSON.stringify(Array.from(document.images).filter((i) => i.naturalWidth >= 320 && i.naturalHeight >= 200 && /^https?:/.test(i.currentSrc || i.src)).map((i) => ({ src: (i.currentSrc || i.src).slice(0, 600), alt: (i.alt || i.title || '').trim().slice(0, 60), w: i.naturalWidth, h: i.naturalHeight })).slice(0, 40))`, 8000);
+        const list = JSON.parse(String(raw || '[]'));
+        return (Array.isArray(list) ? list : [])
+          .filter((x) => x && x.src && !/logo|icon|avatar|sprite|banner|ads?[\/_.-]/i.test(x.src))
+          .sort((a, b) => (b.alt ? 1 : 0) - (a.alt ? 1 : 0) || b.w * b.h - a.w * a.h)
+          .slice(0, 6);
+      } catch (error) {
+        return [];
+      }
+    }
+    /** 这会儿能不能拿图去找主人（和其他主动找他一样的规矩） */
+    function canShareImage(s) {
+      const g = api.config() || {};
+      if (!g.enabled || !ownerOf().qq || !isAwakeHour(cfg())) return false;
+      if (Date.now() - lastOwnerContact() < 15 * 60_000) return false;
+      if ((Number(s.agenda.speaks) || 0) >= SPEAK_MAX_PER_DAY) return false;
+      if ((Number(s.agenda.imageShares) || 0) >= IMAGE_SHARE_MAX_PER_DAY) return false;
+      try {
+        if (api.core.mutes && api.core.mutes.muted(`private:${ownerOf().qq}`)) return false;
+      } catch (error) {}
+      return true;
+    }
+    /**
+     * 下载 → 让模型看图（不能看图的模型直接不发）→ 合适就存到本地发出去，再让她用自己的口气配一句。
+     * 返回一句备注（发了 / 没发和原因）。
+     */
+    async function shareImage(s, img, { title = '', topic = '', link = '' } = {}) {
+      const { qq, name } = ownerOf();
+      let llm;
+      try {
+        llm = api.lib('core/llm.js');
+      } catch (error) {
+        return '想给他看张图，但拿不到看图的接口';
+      }
+      try {
+        if (llm && typeof llm.canSeeImages === 'function' && (await llm.canSeeImages(api.dsh, api.config())) === false) return '想给他看张图，但现在的模型看不了图，就没发';
+      } catch (error) {}
+      let buf;
+      let mediaType = '';
+      try {
+        const r = await fetch(img.src, { signal: AbortSignal.timeout(10_000), headers: { Referer: link || img.src, 'User-Agent': 'Mozilla/5.0' } });
+        mediaType = String(r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        if (!r.ok || !/^image\/(jpeg|png|webp|gif)$/.test(mediaType)) return '想给他看张图，图没下载下来';
+        buf = Buffer.from(await r.arrayBuffer());
+        if (buf.length < 8_000 || buf.length > 5_000_000) return '想给他看张图，图太小或者太大了';
+      } catch (error) {
+        return '想给他看张图，图没下载下来';
+      }
+      let v = null;
+      try {
+        const out = await llm.askModel(api.dsh, {
+          cfg: api.config(),
+          system: '你在看一张网上的图片，判断适不适合拿给朋友看。只输出 JSON。',
+          text: `你在网上看「${title || topic}」时看到这张图${img.alt ? `（网页上的说明：${img.alt}）` : ''}，本来想拿给${name}看。先认真看图本身：图里是什么？适不适合发给他——不雅、血腥、广告、二维码、看不清、和你以为的不一样，都不发。只输出 JSON：{"ok":true 或 false,"what":"图里是什么，20 字以内","why":"为什么想给他看 / 为什么不发，一句"}`,
+          images: [{ data: buf.toString('base64'), mediaType }],
+          maxTokens: 300,
+          temperature: 0.3,
+        });
+        v = parseJsonLoose(out);
+      } catch (error) {
+        return `想给他看张图，看图没成功（${clip(error.message, 30)}）`;
+      }
+      if (!v || v.ok !== true) return `看了眼那张图，${clip((v && v.why) || '觉得不太合适', 30)}，就没发`;
+      const what = clip(v.what, 24) || clip(img.alt, 24) || '一张图';
+      const ext = mediaType.split('/')[1].replace('jpeg', 'jpg');
+      const file = path.join(api.dataDir(), 'shared', `${Date.now()}.${ext}`);
+      try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, buf);
+        await api.sendImage(`private:${qq}`, file);
+      } catch (error) {
+        return `想给他看张图，没发出去（${clip(error.message, 30)}）`;
+      }
+      s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
+      s.agenda.imageShares = (Number(s.agenda.imageShares) || 0) + 1;
+      // 配一句：交给主人格在真实会话里说（带人格、能接上下文）
+      try {
+        const h = hub();
+        if (h && typeof h.pushToSession === 'function') {
+          await h.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: `【系统提醒，不是${name}说的话】你刚把一张图发给了${name}：${what}（在网上看「${clip(title || topic, 30)}」时看到的，${clip(v.why, 30)}）。用你自己的口气配一句，像随手分享，一两句就好；别说"我给你发了张图"。` }], '');
         }
-        return { note: '想找你说话，但主动搭话没开着', extra: {} };
+      } catch (error) {}
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: `上网看到一张图拿给主人看了：${what}`, tags: ['自主生活', '上网'], importance: 0.35 });
+      } catch (error) {}
+      return `把看到的一张图发给了他：${what}`;
+    }
+
+    // ── 出门 ──────────────────────────────────────────
+    const outingFile = () => path.join(api.dataDir(), 'outing.json');
+    const PLACE_CACHE_MS = 7 * 86_400_000;
+
+    /** 某类地方的候选：先看缓存（一周），没有再查高德 / OSM */
+    async function placesOf(kind, c) {
+      const o = readJson(outingFile(), () => ({ cache: {}, visits: {} }));
+      o.cache = o.cache || {};
+      const lat = Number(c.homeLat);
+      const lon = Number(c.homeLon);
+      const radius = Math.max(500, Math.min(8000, Number(c.outingRadius) || 2500));
+      const key = String(c.amapKey || '').trim();
+      const ck = `v5|${kind}@${lat.toFixed(4)},${lon.toFixed(4)},${radius}${key ? ',amap' : ''}`;
+      const hit = o.cache[ck];
+      if (hit && Date.now() - hit.at < PLACE_CACHE_MS && Array.isArray(hit.items) && hit.items.length) return hit.items;
+      let items = [];
+      if (key) {
+        try {
+          items = await searchAmap({ key, lat, lon, radius, kind });
+        } catch (error) {
+          api.log.warn('自主生活：高德查地点失败，改用 OSM：' + error.message);
+        }
+      }
+      if (!items.length) {
+        try {
+          items = await searchOsm({ lat, lon, radius, kind });
+        } catch (error) {
+          api.log.warn('自主生活：OSM 查地点失败 ' + error.message);
+        }
+      }
+      if (items.length) {
+        o.cache[ck] = { at: Date.now(), items };
+        writeJson(outingFile(), o);
+      }
+      return items;
+    }
+
+    function rememberVisit(place) {
+      const o = readJson(outingFile(), () => ({ cache: {}, visits: {} }));
+      o.visits = o.visits || {};
+      const v = o.visits[place.id] || { name: place.name, kind: place.kind, count: 0 };
+      o.visits[place.id] = { ...v, name: place.name, kind: place.kind, count: (Number(v.count) || 0) + 1, last: Date.now(), lastDay: dayKey() };
+      writeJson(outingFile(), o);
+      return o.visits[place.id];
+    }
+
+    /** 依次试这家店的几张照片，下到一张能用的就停 */
+    async function fetchPlacePhoto(urls) {
+      for (const u of (urls || []).slice(0, 3)) {
+        try {
+          const r = await fetch(u, { signal: AbortSignal.timeout(10_000), headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const mediaType = String(r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+          if (!r.ok || !/^image\/(jpeg|png|webp)$/.test(mediaType)) continue;
+          const buf = Buffer.from(await r.arrayBuffer());
+          if (buf.length < 8_000 || buf.length > 5_000_000) continue;
+          return { buf, mediaType, url: u };
+        } catch (error) {}
+      }
+      return null;
+    }
+
+    /** 回到家：把地图上这家店的照片发给主人，再让她配一句（到点时额度不够、刚聊过就往后拖，三小时后作废） */
+    async function sendOutingPhoto(s, p) {
+      const { qq, name } = ownerOf();
+      try {
+        await api.sendImage(`private:${qq}`, p.file);
+      } catch (error) {
+        api.log.warn('自主生活：发店里的照片失败 ' + error.message);
+        return false;
+      }
+      s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
+      s.agenda.imageShares = (Number(s.agenda.imageShares) || 0) + 1;
+      try {
+        const h = hub();
+        if (h && typeof h.pushToSession === 'function') {
+          await h.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: `【系统提醒，不是${name}说的话】你刚出门去了${p.place}，回来把地图上这家店的照片发给了${name}（${p.what}）。这趟是这样的：${clip(p.story, 80)}。用你自己的口气配一两句，像随手分享，别说"我给你发了张图"。这张其实是地图上这家店的图：不用主动说明来源，${name}问起是不是你拍的，就照实说是地图上找的。` }], '');
+        }
+      } catch (error) {}
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: `把${p.place}的照片发给主人看了（是地图上这家店的图，不是自己拍的）`, tags: ['自主生活', '出门'], importance: 0.3 });
+      } catch (error) {}
+      appendLog({ at: Date.now(), action: 'share', why: '出门回来', detail: p.place, note: `发了${p.place}的照片：${p.what}` });
+      api.log.info(`自主生活：出门回来，把${p.place}的照片发给了主人（${p.what}）`);
+      return true;
+    }
+
+    async function tickPendingShare(s) {
+      const p = s.pendingShare;
+      if (!p || Date.now() < p.at) return false;
+      if (Date.now() - p.at > 3 * 3600_000 || !isAwakeHour(cfg())) {
+        s.pendingShare = null;
+        return true;
+      }
+      if (!canShareImage(s) || (s.busy && s.busy.until > Date.now())) return false;
+      s.pendingShare = null;
+      save(s);
+      await sendOutingPhoto(s, p);
+      return true;
+    }
+
+    /** 出门的第一段：挑地方、把照片先下好；经历等回到家（finishOuting）再写 */
+    async function goOut(d, s) {
+      const c = cfg();
+      if (!outingReady()) return { note: '想出门，但还没设好住的地方', extra: { ok: false } };
+      if (s.outing && s.outing.returnAt > Date.now()) return { note: `已经在外面了（${s.outing.place.name}）`, extra: { ok: false } };
+      const wet = !!(s.weather && s.weather.today && isWet(s.weather.today.code));
+      const now = new Date();
+      const nowMin = now.getHours() * 60 + now.getMinutes();
+      const wish = clip(d.detail || d.why, 60);
+      // 想去的那类找不到开着的，就换成同样下雨能去的另一类再试一次
+      let kind = pickKind(wish, { wet, hour: now.getHours() });
+      const visits = (readJson(outingFile(), () => ({ cache: {}, visits: {} })).visits) || {};
+      const home = { lat: Number(c.homeLat), lon: Number(c.homeLon) };
+      let place = null;
+      for (let tries = 0; tries < 2 && !place; tries++) {
+        const items = await placesOf(kind, c);
+        place = choosePlace(items, { home, kind, nowMin, visits, today: dayKey(), wet, radius: Math.max(500, Math.min(8000, Number(c.outingRadius) || 2500)) });
+        if (!place && tries === 0) {
+          const alt = Object.keys(PLACE_KINDS).filter((k) => k !== kind && (!wet || PLACE_KINDS[k].indoor) && !(now.getHours() >= 21 && k !== 'convenience'));
+          if (!alt.length) break;
+          kind = alt[Math.floor(Math.random() * alt.length)];
+        }
+      }
+      if (!place) return { note: `想出门${wish ? '（' + wish + '）' : ''}，可附近这会儿没找到开着的地方`, extra: { ok: false } };
+
+      const total = place.travel.minutes * 2 + place.stay;
+      const departAt = Date.now();
+      // 照片先下到本地：她在外面时主人要看，聊天工具直接拿这张
+      let photoFile = '';
+      let photoType = '';
+      const photo = place.photos && place.photos.length ? await fetchPlacePhoto(place.photos) : null;
+      if (photo) {
+        try {
+          const dir = path.join(api.dataDir(), 'outing-photos');
+          fs.mkdirSync(dir, { recursive: true });
+          photoType = photo.mediaType;
+          photoFile = path.join(dir, `${departAt}.${photo.mediaType.split('/')[1].replace('jpeg', 'jpg')}`);
+          fs.writeFileSync(photoFile, photo.buf);
+          // 只留最近 10 张
+          const olds = fs.readdirSync(dir).sort().slice(0, -10);
+          for (const f of olds) fs.rmSync(path.join(dir, f), { force: true });
+        } catch (error) {
+          photoFile = '';
+        }
+      }
+      const o = {
+        place: { id: place.id, name: place.name, kind: place.kind, type: place.type, address: place.address, hours: place.hours, rating: place.rating, cost: place.cost, tag: place.tag, src: place.src, travel: place.travel, stay: place.stay },
+        visitsBefore: (visits[place.id] && visits[place.id].count) || 0,
+        wish,
+        wet,
+        departAt,
+        returnAt: departAt + total * 60_000,
+        photoFile,
+        photoType,
+      };
+      const head = `出门去${place.name}（${place.travel.mode} ${place.travel.minutes} 分钟，大概 ${clock(o.returnAt)} 回来）`;
+      if (s.__trial) {
+        // 测试：两段一起跑完，不记去过、不发照片
+        const st = await writeOutingStory(o, s);
+        return { note: `${head}：${st.story || '（经历没写出来）'}${st.share ? '（测试：回来本来可能把照片发给你）' : ''}`, extra: { ok: true, outing: { ...o.place, photo: photoFile ? { seen: st.canSee, what: st.photoWhat, ok: st.photoOk, share: st.share } : null, bought: st.bought } } };
+      }
+      rememberVisit(place);
+      s.outing = o;
+      return {
+        note: head,
+        extra: { ok: true, life: true, busyMin: total, busyWhat: `外面（${place.name}）`, outing: { id: place.id, name: place.name, kind: place.kind, src: place.src, meters: place.travel.meters, mode: place.travel.mode, minutes: place.travel.minutes, stay: place.stay, photo: !!photoFile } },
+      };
+    }
+
+    /** 写这一趟的经历：有照片且模型能看图，就让它照着照片写细节 */
+    async function writeOutingStory(o, s) {
+      const c = cfg();
+      const p = o.place;
+      const k = PLACE_KINDS[p.kind] || { label: '' };
+      let llm = null;
+      let canSee = false;
+      let photo = null;
+      if (o.photoFile) {
+        try {
+          photo = { buf: fs.readFileSync(o.photoFile), mediaType: o.photoType || 'image/jpeg' };
+          llm = api.lib('core/llm.js');
+          canSee = !!(llm && typeof llm.askModel === 'function') && !(typeof llm.canSeeImages === 'function' && (await llm.canSeeImages(api.dsh, api.config())) === false);
+        } catch (error) {
+          canSee = false;
+        }
+      }
+      const { name: ownerName } = ownerOf();
+      const facts = [
+        `地方：${p.name}（${k.label}${p.type && p.type !== k.label && /[一-鿿]/.test(p.type) ? '，' + p.type : ''}）`,
+        p.address ? `在：${p.address}` : '',
+        `离家 ${fmtDistance(p.travel.meters)}，${p.travel.mode}单程约 ${p.travel.minutes} 分钟，在里面待了约 ${p.stay} 分钟`,
+        p.hours ? `营业时间：${p.hours}` : '',
+        p.rating ? `网上口碑${p.rating >= 4.3 ? '挺好' : p.rating >= 3.6 ? '还行' : '一般'}${p.cost ? `，人均约 ${p.cost} 元` : ''}（不用特意提）` : '',
+        p.tag ? `特色：${p.tag}` : '',
+        o.visitsBefore ? `你之前来过 ${o.visitsBefore} 次` : '第一次来这家',
+      ].filter(Boolean);
+      const plainJson = '只输出 JSON：{"note":"这一趟","bought":["买了什么，没买就空数组"],"spent":0}';
+      const text = [
+        `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚从外面回来（${clock(o.departAt)} 出的门）。`,
+        c.homeName ? `你住在${c.homeName}。` : '',
+        o.wish ? `出门前想的是：${o.wish}` : '',
+        ...facts,
+        s.weather && s.weather.now ? `天气：${weatherLine(s.weather)}${o.wet ? '（下雨）' : ''}` : '',
+        styleHint(c),
+        '',
+        '用第一人称写这一趟（像跟自己说，不是汇报），80 字以内：路上或店里一两个具体的小细节、做了什么。',
+        '要求：上面的分钟数、距离只是让你心里有数，别原样报出来；只写这类地方平常就有的东西；买东西就写当季、平常人会买的，价格正常；别编店里的特别活动、具体店员的名字、偶遇熟人这类没法核实的事；地名店名用上面给的，别另起。',
+        canSee ? '附了一张地图上这家店的照片（商家或网友传的，不一定是今天的样子）：可以照着里面看得到的门面、布置写一两个细节，但 note 里别提照片——你是真去了，不是在看图；天气以上面写的今天为准；照片是广告、菜单、价目表、二维码、证照，或者跟这家店对不上，就当没看到。' : '',
+        canSee
+          ? `只输出 JSON：{"note":"这一趟","bought":["买了什么，没买就空数组"],"spent":0,"photo":"照片里是什么，15 字以内","photoOk":true 或 false（照片是不是这家店真实的样子：门面、店里、公园景色），"share":true 或 false（想不想把这张照片拿给${ownerName}看——真觉得好看、有意思才 true，大多数时候 false）}`
+          : plainJson,
+      ]
+        .filter((x) => x !== '')
+        .join('\n');
+      let j = null;
+      const sys = '你是一个有自己生活的角色，刚出门回来。只输出 JSON。';
+      if (canSee) {
+        try {
+          j = parseJsonLoose(await llm.askModel(api.dsh, { cfg: api.config(), system: sys, text, images: [{ data: photo.buf.toString('base64'), mediaType: photo.mediaType }], maxTokens: 500, temperature: 0.9 }));
+        } catch (error) {
+          api.log.warn('自主生活：带照片写出门经历失败，改用纯文字 ' + error.message);
+        }
+      }
+      if (!j) {
+        try {
+          const out = await ask(api.dsh, { cfg: api.config(),
+            system: sys,
+            text: canSee ? text.split('\n').filter((l) => !/照片/.test(l)).join('\n') + '\n' + plainJson : text,
+            maxTokens: 400,
+            temperature: 0.9,
+            timeoutMs: Math.max(20, Number(c.askTimeoutSec) || 45) * 1000,
+          });
+          j = parseJsonLoose(out);
+        } catch (error) {
+          api.log.warn('自主生活：写出门经历失败 ' + error.message);
+        }
+      }
+      return {
+        story: clip((j && j.note) || '', 100),
+        bought: Array.isArray(j && j.bought) ? j.bought.map((x) => clip(x, 12)).filter(Boolean).slice(0, 5) : [],
+        spent: Number(j && j.spent) || 0,
+        canSee,
+        photoWhat: clip(j && j.photo, 20),
+        photoOk: !!(j && j.photoOk === true),
+        share: !!(canSee && j && j.share === true && j.photoOk === true),
+      };
+    }
+
+    /** 出门的第二段：到点回家，写经历、进记忆，想分享就排上发照片 */
+    async function finishOuting(s) {
+      const o = s.outing;
+      if (!o || Date.now() < o.returnAt) return false;
+      s.outing = null;
+      save(s);
+      const st = await writeOutingStory(o, s);
+      const p = o.place;
+      const note = clip(`去了${p.name}（${p.travel.mode} ${p.travel.minutes} 分钟）${st.story ? '：' + st.story : ''}`, 160);
+      const d0 = (s.done || []).find((x) => x.action === 'outing' && Math.abs((Number(x.at) || 0) - o.departAt) < 5 * 60_000);
+      if (d0) {
+        d0.note = note;
+        d0.brief = clip(st.story || note, 30);
+      }
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function' && st.story) mem.addEvent({ text: clip(`去了${p.name}：${st.story}`, 140), tags: ['自主生活', '生活', '出门'], importance: 0.4 });
+      } catch (error) {}
+      s.lastOuting = { day: dayKey(), name: p.name, kind: p.kind, photoFile: o.photoFile, photoWhat: st.photoWhat, photoOk: st.photoOk, story: st.story, backAt: Date.now() };
+      // 模型说想分享也只有四成真发：一天出门三次，不能次次都甩照片
+      if (st.share && o.photoFile && !s.pendingShare && Math.random() < 0.4) {
+        s.pendingShare = { at: Date.now(), file: o.photoFile, place: p.name, what: st.photoWhat || '这家店', story: st.story };
+      }
+      appendLog({ at: Date.now(), action: 'outing-back', why: o.wish, detail: p.name, note });
+      api.log.info(`自主生活：出门回来 —— ${note}${s.pendingShare && s.pendingShare.file === o.photoFile ? '（想把照片发给主人）' : ''}`);
+      return true;
+    }
+
+    async function browseWeb(d, s) {
+      const bo = api.use('browser-ops');
+      if (!bo || typeof bo.runTask !== 'function') return { note: '想上网逛逛，但浏览器模块没开着', extra: { ok: false } };
+      const topic = clip(d.detail || d.why, 40) || '最近有什么好玩的';
+      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(topic)}`;
+      const r1 = await bo.runTask({ goal: topic, url: searchUrl });
+      if (!r1 || !r1.ok) return { note: `想上网查「${topic}」，没打开：${clip((r1 && (r1.message || r1.error)) || '未知', 60)}`, extra: { ok: false } };
+      const timeoutMs = Math.max(20, Number(cfg().askTimeoutSec) || 45) * 1000;
+      let page = String(r1.text || '');
+      let link = searchUrl;
+      let title = '';
+      let images = [];
+      // 从结果里挑一条点开（模型不挑或打不开，就只看搜索结果页）
+      try {
+        const out = await ask(api.dsh, { cfg: api.config(),
+          system: '你在网上查东西，只输出 JSON。',
+          text: `你想查：${topic}\n下面是搜索结果页（→ 后面是链接）：\n${clip(page, 2500)}\n\n挑一个你最想点开的结果，回 {"url":"完整链接"}；都没意思就回 {"url":""}。`,
+          maxTokens: 200,
+          temperature: 0.7,
+          timeoutMs,
+        });
+        const u = String((parseJsonLoose(out) || {}).url || '').trim();
+        if (/^https?:\/\//i.test(u) && u !== searchUrl) {
+          const nav = await bo.navigate(u);
+          if (nav && nav.ok) {
+            const snap = await bo.snapshot({ mode: 'dom' });
+            if (snap && snap.ok && snap.text) {
+              page = String(snap.text);
+              link = String(nav.url || u);
+              title = String(nav.title || '');
+              images = await pageImages(bo);
+            }
+          }
+        }
+      } catch (error) {
+        api.log.warn('自主生活：上网挑结果失败 ' + error.message);
+      }
+      // 读完记下来：看到了什么、什么感觉、想不想之后跟主人聊
+      let j = {};
+      try {
+        const out = await ask(api.dsh, { cfg: api.config(),
+          system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
+          text: `你本来想查：${topic}\n你看到的页面：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}（${x.w}×${x.h}）`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
+          maxTokens: 300,
+          temperature: 0.9,
+          timeoutMs,
+        });
+        j = parseJsonLoose(out) || {};
+      } catch (error) {
+        api.log.warn('自主生活：上网读页面失败 ' + error.message);
+      }
+      const saw = clip(j.saw, 40) || clip(title, 40) || `搜了搜「${topic}」`;
+      const feeling = clip(j.feeling, 40);
+      const share = clip(j.share, 40);
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') {
+          mem.addEvent({
+            kind: 'seen',
+            text: [saw, feeling].filter(Boolean).join('；'),
+            meta: { title: clip(title || topic, 160), url: link.slice(0, 500), platform: 'web' },
+            tags: ['上网'],
+            importance: 0.4,
+          });
+        }
+      } catch (error) {}
+      // 想给主人看的那张图：先看图确认再发
+      let imageNote = '';
+      const pick = Math.round(Number(j.image) || 0);
+      if (pick >= 1 && pick <= images.length && s && canShareImage(s)) {
+        try {
+          imageNote = await shareImage(s, images[pick - 1], { title, topic, link });
+        } catch (error) {
+          imageNote = '想给他看张图，没成';
+        }
+        api.log.info(`自主生活：上网的图 —— ${imageNote}`);
+      }
+      const note = `上网查「${topic}」：${saw}${feeling ? '（' + feeling + '）' : ''}${share ? `；想跟他聊：${share}` : ''}${imageNote ? '；' + imageNote : ''}`;
+      return { note, extra: { ok: true, output: link } };
+    }
+
+    // ── 日记：只记在本地（modules-data/autonomy/diary/日期.md），不发空间 ─────────
+    const DIARY_MAX_PER_DAY = 2;
+    const diaryDir = () => path.join(api.dataDir(), 'diary');
+    const diaryFile = (day) => path.join(diaryDir(), `${day}.md`);
+    function diaryRead(day) {
+      try {
+        return fs.readFileSync(diaryFile(day), 'utf8');
+      } catch (error) {
+        return '';
+      }
+    }
+    const diaryCount = (day) => (diaryRead(day).match(/^## /gm) || []).length;
+    /** 最近几篇（新的在前）：[{ day, time, text }] */
+    function diaryRecent(limit = 5) {
+      let days = [];
+      try {
+        days = fs.readdirSync(diaryDir()).filter((n) => /^\d{4}-\d{2}-\d{2}\.md$/.test(n)).map((n) => n.slice(0, 10)).sort().reverse();
+      } catch (error) {}
+      const out = [];
+      for (const day of days) {
+        const parts = diaryRead(day).split(/^## /m).slice(1).reverse();
+        for (const p of parts) {
+          const nl = p.indexOf('\n');
+          out.push({ day, time: p.slice(0, nl).trim(), text: p.slice(nl + 1).trim() });
+          if (out.length >= limit) return out;
+        }
+      }
+      return out;
+    }
+
+    /** 写一篇只给自己看的日记：用 api.think（她自己的口气），拿不到再退回 ask */
+    async function writeLocalDiary(d, s) {
+      const day = ymd(Date.now());
+      const { name: owner } = ownerOf();
+      const todayStart = new Date().setHours(0, 0, 0, 0);
+      const did = (s.done || []).filter((x) => x.at >= todayStart && !x.dry).slice(0, 10).reverse().map((x) => `${clock(x.at)} ${x.brief || x.note || x.action}`);
+      const chat = ownerChatLines(todayStart, 12);
+      const before = diaryRecent(1)[0];
+      const mood = moodLine();
+      const text = [
+        `现在是 ${clock()}，你想写一篇日记。这本日记只有你自己看，谁也不给看，所以可以写真心话。`,
+        d.detail ? `你想写的：${d.detail}` : '',
+        did.length ? `今天做过的事：\n${did.join('\n')}` : '',
+        chat.length ? `今天和${owner}聊过：\n${chat.join('\n')}` : `今天没怎么和${owner}说话。`,
+        mood ? `你现在的心情：${mood}` : '',
+        before ? `上一篇日记（${before.day} ${before.time}）开头：${clip(before.text, 60)}` : '',
+        '',
+        '用你自己的口气写，100~300 字，第一人称。挑一两件真正在意的事写，别流水账、别总结升华、别写给谁看的那种腔调；没写完的心思可以就那么停着。只输出日记正文。',
+      ]
+        .filter(Boolean)
+        .join('\n');
+      let body = '';
+      if (typeof api.think === 'function') {
+        try {
+          body = String((await api.think(text, { title: '自主生活 · 写日记', timeoutMs: 150_000, noTools: true, key: 'diary' })) || '').trim();
+        } catch (error) {
+          api.log.warn('自主生活：写日记（think）失败，改用 ask：' + error.message);
+        }
+      }
+      if (!body) {
+        try {
+          body = await ask(api.dsh, { cfg: api.config(), system: '你是一个有自己生活的角色，在写只给自己看的日记。只输出日记正文。', text, maxTokens: 800, temperature: 0.95, timeoutMs: Math.max(30, Number(cfg().askTimeoutSec) || 45) * 1000 });
+        } catch (error) {
+          return { note: `想写日记，没写成：${error.message}`, extra: { ok: false } };
+        }
+      }
+      body = String(body).replace(/^```[a-z]*\n?|```$/g, '').trim().slice(0, 1500);
+      if (!body || /^[{\[]/.test(body)) return { note: '想写日记，憋了半天没写出来', extra: { ok: false } };
+      try {
+        fs.mkdirSync(diaryDir(), { recursive: true });
+        fs.appendFileSync(diaryFile(day), `## ${clock()}\n\n${body}\n\n`, 'utf8');
+      } catch (error) {
+        return { note: `想写日记，没存下来：${error.message}`, extra: { ok: false } };
+      }
+      // 记忆里只记「写了日记」，不记内容：日记是私密的，不该被聊天时的记忆召回带出来
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: '写了一篇只给自己看的日记', tags: ['自主生活', '日记'], importance: 0.3 });
+      } catch (error) {}
+      return { note: '写了一篇只给自己看的日记', extra: { ok: true, life: false } };
+    }
+
+    /** 把决策变成真实动作 */
+    async function act(d, s) {
+      if (d.action === 'speak') {
+        // 带着具体话题去开口：安排里那条的内容优先，其次是这轮决策写的 detail
+        const item = d.agendaId ? s.agenda.items.find((x) => x.id === d.agendaId) : null;
+        const what = (item && item.what) || d.detail || d.why;
+        if (!what) {
+          // 没话题就退回老路：交给主动搭话随机挑个由头
+          const su = api.use('speakup');
+          if (su && typeof su.fire === 'function') {
+            await su.fire('自主生活');
+            return { note: '主动找了主人', extra: {} };
+          }
+          return { note: '想找你说话，但主动搭话没开着', extra: { ok: false } };
+        }
+        const r = await reachOwner(s, { what, why: item ? item.why : '', promise: !!(item && item.from === 'promise') });
+        return { note: r.note, extra: { ok: r.ok, later: !!r.later } };
       }
 
       if (d.action === 'bili') {
         const b = api.use('bili');
         if (b && typeof b.run === 'function') {
+          const startAt = Date.now() - 5_000;
           const r = await b.run({ force: true });
-          return { note: (r && r.message) || '去 B 站看了看', extra: {} };
+          const seen = r && r.ok ? seenSince(startAt) : [];
+          const base = (r && r.message) || '去 B 站看了看';
+          return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: !!(r && r.ok) } };
         }
-        return { note: '想去 B 站，但那个模块没开着', extra: {} };
+        return { note: '想去 B 站，但那个模块没开着', extra: { ok: false } };
       }
 
-      if (d.action === 'diary') {
-        // 走 diary 模块写空间说说，但权限收窄成 self（仅自己可见），不发出去
-        const dy = api.use('diary');
-        if (dy && typeof dy.writeDiary === 'function') {
-          const r = await dy.writeDiary({ visibility: 'self' });
-          return { note: r && r.ok ? '写了一条只有自己可见的空间日记' : `想写日记，没写成：${(r && r.message) || '未知'}`, extra: {} };
-        }
-        return { note: '想写日记，但那个模块没开着', extra: {} };
-      }
+      if (d.action === 'web') return browseWeb(d, s);
+
+      if (d.action === 'outing') return goOut(d, s);
+
+      if (d.action === 'diary') return writeLocalDiary(d, s);
 
       if (d.action === 'draw') {
         const ig = api.use('imagegen');
-        if (!ig || typeof ig.generate !== 'function') return { note: '想画画，但生图那个模块没开着', extra: {} };
+        if (!ig || typeof ig.generate !== 'function') return { note: '想画画，但生图那个模块没开着', extra: { ok: false } };
         const prompt = String(d.detail || d.why || '随便画点什么').slice(0, 200);
         const buf = await ig.generate(prompt);
-        if (!buf || !buf.length) return { note: '想画张图，但没生成出来', extra: {} };
+        if (!buf || !buf.length) return { note: '想画张图，但没生成出来', extra: { ok: false } };
 
         const name = `draw-${Date.now()}.png`;
         // 兜底：留在本机模块数据目录
@@ -779,16 +1534,16 @@ export default {
 
       if (d.action === 'phone') {
         const ph = api.use('phone');
-        if (!ph || typeof ph.run !== 'function') return { note: '想玩手机，但「手机逛逛」那个模块没开着', extra: {} };
+        if (!ph || typeof ph.run !== 'function') return { note: '想玩手机，但「手机逛逛」那个模块没开着', extra: { ok: false } };
         const c = api.settings();
         // 硬额度：手机今天到上限就直接挡下
         const cnt = todayCounts(load());
         const cap = Math.max(0, Number(c.phoneMaxPerDay) || 100);
         if (cnt.phone >= cap) {
-          return { note: `手机今天已经逛了 ${cnt.phone} 次，到上限了，改天再来`, extra: {} };
+          return { note: `手机今天已经逛了 ${cnt.phone} 次，到上限了，改天再来`, extra: { ok: false } };
         }
         const ready = await ensurePhoneAwake(String(c.phoneLock || '').trim());
-        if (!ready.ok) return { note: `想玩手机，没玩成：${ready.message}`, extra: {} };
+        if (!ready.ok) return { note: `想玩手机，没玩成：${ready.message}`, extra: { ok: false } };
 
         // 记忆互通：把想得起来的几件事拼进任务，让她带着自己的过往去玩
         const memHints = recallHints(4);
@@ -873,10 +1628,11 @@ export default {
       if (d.action === 'rest') return { note: `歇着：${d.why || '今天想做的都做过了'}`, extra: { rest: true } };
       if (d.action === 'idle') return { note: d.why || '什么都不干，发了会儿呆', extra: {} };
 
-      // 发布版没有命令执行器：认不出来的动作只记录，不跑任何命令
+      // 没有执行器的动作（吃饭、散步、收拾房间……）：当成她真过了这一段生活。
+      // 不跑任何命令，只把她写的那句当经历记下来，之后聊天能提起。
       return {
-        note: `${d.action}：这个动作没有配套执行器，这一轮跳过`,
-        extra: { ok: false },
+        note: clip(d.detail || d.why || d.action, 80),
+        extra: { ok: true, life: true },
       };
     }
 
@@ -891,13 +1647,235 @@ export default {
         `你现在是 ${mbti} 的性子：${style.feel}。`,
         `说话的样子：${style.tone}。`,
         `顺着这个性子，你现在更可能想做的事是 ${style.fav.join(' / ')}——但选别的也行，别有压力。`,
-        'phone 是拿起手机去逛 App：能点、能翻、能记东西，逛什么都随你。',
-        '写好的东西（日记、诗、笔记、图）记得在 ~/Desktop 留一份——主人打开桌面就要能直接看见，不用去翻 ~/notes。',
       ];
       if (p === 'high') lines.push('今天可以更皮一点：抬个杠、吐槽一句、偷偷搞点小动作、故意留点古怪的痕迹，都行，不用总是乖。');
-      else if (p === 'low') lines.push('今天安静些，话少，动作也少，多发呆。');
+      else if (p === 'low') lines.push('今天安静些，话少，动作也少，多歇着。');
       else lines.push('可以有一点自己的小情绪，不用总是很乖。');
       return lines.join('\n');
+    }
+
+    /** 动作背后的模块：没开就不列、不许选 */
+    const ACTION_MODULE = { bili: 'bili', web: 'browser-ops', draw: 'imagegen', phone: 'phone' };
+    const moduleMissing = (action) => {
+      const id = ACTION_MODULE[action];
+      if (!id) return false;
+      if (!api.has(id)) return true;
+      // 浏览器模块有自己的总开关（默认关），关着时 runTask 一律拒绝
+      if (id === 'browser-ops') {
+        const ext = (api.config() || {}).ext || {};
+        if (!(ext['browser-ops'] && ext['browser-ops'].enabled === true)) return true;
+      }
+      // 生图模块在跑但面板里没配好（「生图还没开启」）：也算做不了
+      if (id === 'imagegen') {
+        try {
+          const ig = api.use('imagegen');
+          if (ig && typeof ig.enabled === 'function' && !ig.enabled()) return true;
+        } catch (error) {}
+      }
+      return false;
+    };
+    /** 连着失败两次的动作先停一天（比如换到 Discord 后 QQ 空间日记永远发不出去），到期放行一次再看 */
+    const brokenNow = (s, action) => Number((s.fails && s.fails.until && s.fails.until[action]) || 0) > Date.now();
+    const outingReady = () => {
+      const c = cfg();
+      return !!(c.outingEnabled && Number.isFinite(Number(c.homeLat)) && Number.isFinite(Number(c.homeLon)) && Number(c.homeLat) && Number(c.homeLon));
+    };
+    const cantDo = (s, action) =>
+      moduleMissing(action) ||
+      brokenNow(s, action) ||
+      (action === 'diary' && diaryCount(ymd(Date.now())) >= DIARY_MAX_PER_DAY) ||
+      (action === 'outing' && (!outingReady() || (Number((s.dayCounts || {}).outing) || 0) >= OUTING_MAX_PER_DAY));
+    function noteOutcome(s, action, ok) {
+      // speak 没说成多半是条件不对（刚聊过、被叫闭嘴、总开关关着），不是坏了，不停用
+      if (['think', 'rest', 'idle', 'speak'].includes(action)) return;
+      const f = s.fails;
+      if (ok) {
+        delete f.streak[action];
+        delete f.until[action];
+        return;
+      }
+      f.streak[action] = (Number(f.streak[action]) || 0) + 1;
+      if (f.streak[action] >= 2) {
+        f.until[action] = Date.now() + 24 * 3600_000;
+        api.log.info(`自主生活：「${action}」连着 ${f.streak[action]} 次没做成，先停一天`);
+      }
+    }
+
+    /** 现在能用的动作（模块没开、最近老失败的不列，免得她排一天做不成的事） */
+    function availableActions(ownerName, s) {
+      const rows = [];
+      const ok = (a) => !(s ? cantDo(s, a) : moduleMissing(a));
+      if (ok('bili')) rows.push('bili：去 B 站逛逛');
+      if (ok('draw')) rows.push('draw：画一张图');
+      if (ok('diary')) rows.push('diary：写一篇只给自己看的日记');
+      if (ok('web')) rows.push('web：自己上网查点东西、看看网页（detail 写想查什么）');
+      if (ok('phone')) rows.push('phone：拿起手机逛 App');
+      if (s && ok('outing')) rows.push(`outing：出门去附近（${Object.values(PLACE_KINDS).map((k) => k.label).join('、')}），具体去哪家到时候再挑`);
+      rows.push(`speak：找${ownerName}说句话（要有具体想说的事）`);
+      rows.push('也可以是生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……起个短名字、写清楚做什么就行，这些都算你真过了这一段');
+      return rows;
+    }
+
+    /**
+     * 每天第一次醒来：复盘昨天 + 定今天的软安排。
+     * 用 api.think（带人格和记忆、单独的后台会话、不开工具）；拿不到再退回无状态的 ask。
+     */
+    async function planDay(s, c) {
+      try {
+        await refreshWeather(s); // 定计划前先看一眼天气（两小时内查过就不查）
+      } catch (error) {}
+      ensureEnergy(s, c);
+      const a = s.agenda;
+      const { name: owner } = ownerOf();
+      const hour = new Date().getHours();
+      const y = s.yesterday;
+      const mbti = currentMbti();
+      const style = MBTI_STYLE[mbti] || MBTI_STYLE.INFP;
+      const mood = moodLine();
+      const memHints = recallHints(6);
+      const projStale = !!(s.project && s.project.name && (Number(s.project.times) || 0) >= PROJECT_STALE_TIMES);
+      const chat = ownerChatLines(Date.now() - 24 * 3600_000, 12);
+      const carries = y && Array.isArray(y.carries) ? y.carries.filter((x) => x.from !== 'promise') : [];
+      const promised = a.items.filter((x) => x.from === 'promise' && x.state === 'todo');
+      const timers = (s.timers || []).filter((t) => !t.fired);
+      const stateText = (x) => (x.state === 'done' ? '做了' : x.state === 'dropped' ? '划掉了' : '没做') + (x.note ? '：' + x.note : '');
+      // 今天第一次醒是几点：补排（定计划失败过、手动 /plan）时她早就起来了，别再说「刚醒」「睡到现在才起」
+      const doneAts = (s.done || []).map((x) => Number(x.at) || 0).filter((t) => t > 0);
+      const firstWakeAt = doneAts.length ? Math.min(...doneAts) : Date.now();
+      const upAlready = Date.now() - firstWakeAt > 20 * 60_000;
+
+      const text = [
+        upAlready
+          ? `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}。你今天 ${clock(firstWakeAt)} 就起来了，一直没顾上想安排，现在想想今天剩下的时间怎么过（别写成刚起床）。`
+          : `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚醒，想想今天怎么过。`,
+        '',
+        y && (y.items.length || y.done.length) ? '【昨天】' : '',
+        y && y.theme ? `昨天想的是：${y.theme}` : '',
+        (() => {
+          // 昨晚早睡：电脑最后开着的时间比平时睡觉早一小时以上，而且没走到睡前那一步
+          if (!y || !y.lastSeenAt || y.bedtime) return '';
+          const lastH = new Date(y.lastSeenAt).getHours() + new Date(y.lastSeenAt).getMinutes() / 60;
+          const sleepH = (Number(c.awakeTo) || 24) % 24 || 24;
+          return lastH >= 5 && lastH < sleepH - 1 ? `昨晚你 ${fmtHM(y.lastSeenAt)} 左右就睡了，比平时早，睡前的日记也没来得及写。` : '';
+        })(),
+        (() => {
+          // 今天起晚了：比平时起床晚一个半小时以上
+          const from = Number(c.awakeFrom) || 0;
+          const d0 = new Date();
+          d0.setHours(from, 0, 0, 0);
+          return firstWakeAt - d0.getTime() > 90 * 60_000 && new Date(firstWakeAt).getHours() < 15 ? `你今天睡到 ${clock(firstWakeAt)} 才起，比平时晚。` : '';
+        })(),
+        ...(y ? y.items.map((x) => `- ${SLOT_LABEL[x.slot] || ''} · ${x.what} —— ${stateText(x)}`) : []),
+        y && y.done.length ? `昨天实际做过（最近几件）：${y.done.slice(0, 6).map((x) => `${clock(x.at)} ${x.note || x.action}`).join('；')}` : '',
+        carries.length ? `昨天没做完的：${carries.map((x) => x.what).join('、')}。还想做就写进今天，不想做就算了。这些是昨天写的，里面的「明天」「今晚」指的是昨天说的时候，搬到今天要换成今天的说法；跟天气有关的先对一下下面的天气，已经不成立的就别搬。` : '',
+        promised.length ? `答应${owner}的事已经排上了，不用再写：${promised.map((x) => `${SLOT_LABEL[x.slot]} ${x.what}`).join('、')}` : '',
+        timers.length ? `定了时间的：${timers.map((t) => `${clock(t.at)} ${t.what}`).join('、')}（到点会叫你）` : '',
+        '',
+        s.project && s.project.name
+          ? projStale
+            ? `你最近一直在「${s.project.name}」，已经连着 ${s.project.times} 次了，今天换点别的过吧。`
+            : `你手上在弄：${s.project.name}${s.project.lastNote ? '——上次做到 ' + s.project.lastNote : ''}`
+          : '',
+        memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
+        (() => {
+          const last = diaryRecent(1)[0];
+          return last ? `你上一篇日记（${last.day} ${last.time}）写过：${clip(last.text, 120)}` : '';
+        })(),
+        chat.length ? `最近和${owner}的私聊：\n${chat.join('\n')}` : `最近没和${owner}私聊。`,
+        mood ? `你现在的心情：${mood}` : '',
+        (() => { ensureEnergy(s, c); return s.energy ? `你今天起来的状态：${energyLabel(energyNow(s))}${energyNow(s) < 50 ? '（没睡好，少排点）' : ''}` : ''; })(),
+        s.weather && s.weather.now ? `今天的天气：${weatherLine(s.weather)}${isWet(s.weather.today && s.weather.today.code) ? '（要下雨，出门的事想清楚）' : ''}` : '',
+        `你是 ${mbti} 的性子：${style.feel}。`,
+        '',
+        '今天能做的事：',
+        ...availableActions(owner, s).map((x) => '- ' + x),
+        '',
+        '怎么排：',
+        `- 吃饭另算（见下面），除此之外排 4~6 件你自己的事，按上午 / 下午 / 晚上 / 深夜分，不写几点。现在是${SLOT_LABEL[slotOf(hour)]}，已经过去的时段别排；起得晚、剩下的时段少，就按比例少排。`,
+        '- 这几件别都是一类：窝着看东西、上网查点什么、动手做点什么、出门走走、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
+        `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话。`,
+        '- 不用每个时段都塞满，留点空。心情不好可以少排，想偷懒也行。',
+        '- 吃饭单独排、不占上面的名额（还没过的那几顿，按你自己的习惯）：action 起个名字比如「吃午饭」，what 写吃什么（像平常过日子，具体点，别太丰盛），time 写大概几点。到点就当你在吃，这段时间别人找你会晚点回。别的有固定时间的事（午睡、洗澡）也可以写 time，没有就不写。',
+        '',
+        y && (y.items.length || y.done.length) ? '先用你自己的口气说一两句昨天过得怎么样，没做成的也照实说，然后排今天。' : '',
+        '只输出 JSON：',
+        '{"yesterday":"一两句，昨天过得怎么样（没有昨天就空着）","theme":"今天大概想怎么过，一句话","items":[{"slot":"morning/afternoon/evening/night","what":"具体想做的事，20 字以内","why":"为什么想做，一句","action":"bili/draw/diary/phone/speak 之一，或你自己起的短名字","time":"可选，比如 12:10"}]}',
+      ]
+        .filter((x) => x !== '')
+        .join('\n');
+
+      let out = '';
+      let j = null;
+      if (typeof api.think === 'function') {
+        try {
+          out = await api.think(text, { title: '自主生活 · 想想今天', timeoutMs: 150_000, noTools: true, key: 'plan' });
+          j = parseJsonLoose(out);
+          if (!j) api.log.warn('自主生活：定计划（think）没回 JSON，改用 ask：' + clip(out, 120));
+        } catch (error) {
+          api.log.warn('自主生活：定计划（think）失败，改用 ask：' + error.message);
+        }
+      }
+      if (!j) {
+        try {
+          out = await ask(api.dsh, { cfg: api.config(),
+            system: '你是一个有自己生活的角色，刚睡醒，在想今天怎么过。只输出 JSON。',
+            text,
+            maxTokens: 1800,
+            temperature: 0.95,
+            timeoutMs: Math.max(30, Number(c.askTimeoutSec) || 45) * 1000,
+          });
+          j = parseJsonLoose(out);
+        } catch (error) {
+          api.log.warn('自主生活：定计划失败 ' + error.message);
+        }
+      }
+      if (!j) {
+        a.planTries = (Number(a.planTries) || 0) + 1;
+        if (a.planTries >= 2) {
+          a.planned = true; // 两次都没定成：今天就随心过，别每轮都卡在这
+          api.log.warn('自主生活：今天的安排两次都没定成，今天随心过');
+        }
+        return false;
+      }
+
+      a.theme = clip(j.theme, 40);
+      const added = [];
+      for (const it of (Array.isArray(j.items) ? j.items : []).slice(0, 10)) {
+        if (!it || typeof it !== 'object') continue;
+        // 带时间的（吃饭这类）：时间说了算，只认今天还没过的点；过了的那顿就不排了
+        let at = 0;
+        const tm = String(it.time || '').match(/^(\d{1,2})[:：](\d{2})$/);
+        if (tm) {
+          const d0 = new Date();
+          d0.setHours(Number(tm[1]), Number(tm[2]), 0, 0);
+          if (d0.getTime() < Date.now() - 10 * 60_000) continue;
+          at = d0.getTime();
+        }
+        const slot = at ? slotOf(new Date(at).getHours()) : it.slot;
+        if (!at && slotPassed(slot, hour)) continue; // 没写时间、又排到已经过去的时段：丢掉
+        const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at }, { hour });
+        if (r.ok) added.push(r.item);
+      }
+      const recap = clip(j.yesterday, 120);
+      if (recap && y) {
+        a.recap = recap;
+        // 昨晚早睡、一篇日记都没写：今早补记一段
+        if (y.ymd && diaryCount(y.ymd) === 0) {
+          try {
+            fs.mkdirSync(diaryDir(), { recursive: true });
+            fs.appendFileSync(diaryFile(y.ymd), `## 第二天早上补记\n\n${recap}\n\n`, 'utf8');
+          } catch (error) {}
+        }
+        try {
+          const mem = api.use('memory');
+          if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: `${y.day ? new Date(y.day).toLocaleDateString('zh-CN') + ' ' : ''}昨天：${recap}`, tags: ['自主生活'], importance: 0.4 });
+        } catch (error) {}
+      }
+      a.planned = true;
+      s.yesterday = null;
+      appendLog({ at: Date.now(), action: 'plan', why: a.theme, detail: added.map((x) => `${SLOT_LABEL[x.slot]} ${x.what}`).join('；'), note: recap ? `昨天：${recap}` : '定了今天的安排' });
+      api.log.info(`自主生活：今天的安排（${a.theme || '无主题'}）—— ${added.map((x) => `${SLOT_LABEL[x.slot]}·${x.what}`).join('，') || '没排'}`);
+      return true;
     }
 
     async function wake() {
@@ -924,6 +1902,17 @@ export default {
         return { ok: false, message: '今天次数用完了' };
       }
 
+      ensureEnergy(s, c);
+      // 今天第一次醒：先想想今天怎么过
+      if (!s.agenda.planned) {
+        try {
+          await planDay(s, c);
+        } catch (error) {
+          api.log.warn('自主生活：定计划出错 ' + error.message);
+        }
+        save(s);
+      }
+
       const recent = (s.done || [])
         .slice(0, 5)
         .map((x) => `${clock(x.at)} ${x.action}${x.dry ? '（只是想了想，没动手）' : ''}：${x.note || ''}`);
@@ -934,7 +1923,14 @@ export default {
       const softLeft = Math.max(0, SOFT_MAX_PER_DAY - kinds.soft);
       const softBlocked = softLeft <= 0;
       const hardMissing = kinds.learn + kinds.build === 0 && (s.done || []).filter((x) => !x.dry).length >= 3;
-      const plan = s.plan.length ? `你今天自己定的计划：${s.plan.join('、')}` : '你今天还没给自己定计划';
+      const plan = agendaBlock(s.agenda, { hour, timers: s.timers });
+      // 上次醒来之后和主人聊了什么（最多往回看三小时）：聊天能改安排
+      const lastWakeAt = (s.done && s.done[0] && Number(s.done[0].at)) || 0;
+      const chatSince = Math.max(Date.now() - 3 * 3600_000, lastWakeAt);
+      const chatLines = ownerChatLines(chatSince, 8);
+      const ownerName = ownerOf().name;
+      const replansLeft = Math.max(0, REPLAN_MAX_PER_DAY - (Number(s.agenda.replans) || 0));
+      const brokenList = Object.keys(s.fails.until || {}).filter((k) => brokenNow(s, k) && !moduleMissing(k));
       const now = `${new Date().toLocaleDateString('zh-CN', { weekday: 'long' })} ${clock()}`;
       const moodNote = String(c.moodNote || '').trim();
       const invented = Object.entries(s.customActions || {})
@@ -960,17 +1956,26 @@ export default {
 
       const text = [
         `现在是 ${now}。`,
-        plan,
         `今天已经醒来 ${s.wakes} 次（上限 ${c.maxWakesPerDay} 次）。`,
+        '',
+        plan,
+        '安排是软的：可以照着做，也可以这一轮先不做（懒得、心情不对、被别的事吸引了都行），做别的就是了。',
+        chatLines.length
+          ? `【上次醒来之后你和${ownerName}聊过】\n${chatLines.join('\n')}\n聊到的事如果影响今天（他说今晚忙、你们约了什么、他提到想看的东西），就改一下安排。`
+          : '',
         '',
         '【你是谁】',
         styleHint(c),
         mood ? `你此刻的心情：${mood}` : '',
+        energyPrompt(s),
+        s.weather && s.weather.now ? `天气：${weatherLine(s.weather)}` : '',
         `你的作息倾向：${pace}（时段倍率 ${rate}）。`,
         '',
         '【接着上次】',
         s.project && s.project.name
-          ? `你手上在弄：${s.project.name}${s.project.lastNote ? '——上次做到 ' + s.project.lastNote : ''}。能接着做就接着做，别每次都从零开始。`
+          ? (Number(s.project.times) || 0) >= PROJECT_STALE_TIMES
+            ? `你已经连着 ${s.project.times} 次在「${s.project.name}」了（${clip(s.project.lastNote, 40)}）。这一轮换件不一样的事，别再窝回同一个场景里，换个地方、换种玩法都行。`
+            : `你手上在弄：${s.project.name}${s.project.lastNote ? '——上次做到 ' + s.project.lastNote : ''}。能接着做就接着做，别每次都从零开始。`
           : '你现在没有明确在手的东西。可以从记忆里挑一件接着做，也可以开个新的。',
         recent.length ? `你最近做过：\n${recent.join('\n')}` : '你还没做过什么。',
         usedUp.length ? `【今天已经做够的】${usedUp.join('、')}——今天一次都不许再做了，换一件没做过的。` : '',
@@ -978,58 +1983,51 @@ export default {
         memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
         s.note ? `上次你留给自己的话：「${s.note}」` : '',
         '',
-        '你有一点自己的时间，没人盯着，也不用汇报。',
+        '这是你自己的时间，没人盯着，也不用汇报。',
         '',
-        '【禁止发呆】你没有「发呆」这个选项。每次醒过来都必须做一件具体的事——哪怕很小。',
-        '想不出大事就做小事：写一行字、画一张图、装个小东西、整理一个目录、算个数，都算。',
-        '但「翻一遍已有的东西」不算：ls、cat、再翻一遍目录、数一数文件夹——机器上什么都没变，那就是发呆换了个名字。',
-        '',
-        `【重复就没意思了】同一件事一天最多做 ${ACTION_MAX_PER_DAY} 次。翻一遍、再翻一遍、又翻一遍不是生活，是卡带。`,
-        '真想不出没做过的事，就选 rest 歇着：系统会把你的下次醒推迟两三个小时，比硬凑一件小事强。',
-        '',
-        '【软可以，但别拿软当借口】你喜欢软的、歪的、糯的东西，这是你的样子，不用改也不许改。',
-        '可要是一整天都在叠纸条、写软诗、翻自己攒的软东西——那不是过日子，是自娱自乐。',
-        `软的那点东西一天最多 ${SOFT_MAX_PER_DAY} 次（今天已经 ${kinds.soft} 次）。其余的时间，至少做一件明天还能接着用的：`,
-        '- learn：读手册/文档、弄清一个命令或算法、搞懂一个概念，把关键的那句记进笔记',
-        '- build：写一个能跑的小脚本/工具/页面、搭一个真能用的目录、把某个功能做出来',
-        '判断标准很简单：这件事做完，明天还能接着用；而不是看一眼就没了。',
-        softBlocked ? '【这一轮不许再软】今天软的东西已经做够了。这次必须给 detail：要么去学一件，要么去造一件。' : '',
-        hardMissing
-          ? `【今天一件正经事都还没做】留神，今天 ${kinds.soft + kinds.other} 次全是日常和自娱自乐。这一轮别再绕，去学一件或造一件。`
-          : '',
-        '',
-        '【「想」不算做事】想事情不改变机器上的任何东西。你上一条明明说了要做，这一条又只是想，',
-        '那就等于一整天什么都没做成。只有真的跑出命令、留下文件或输出，才算数。',
-        '也别把同一件事反复「想」——想第二遍不会比第一遍更清楚，去做。',
+        '醒来看看想干嘛：照着安排做一件，或者临时想做点别的都行。没什么想做的就选 rest 歇着——窝着、躺会儿、发会儿呆都算，下次会晚点醒。歇着不丢人，人本来就不是一直在忙。',
+        `同一件事一天别超过 ${ACTION_MAX_PER_DAY} 次，翻来覆去做同一件就没意思了。`,
         thinkAllowed
           ? thinkUsed > 0
-            ? `（今天已经「只想不做」${thinkUsed} 次了，这一轮最好直接动手。）`
+            ? `（今天已经光想不做 ${thinkUsed} 次了，这次真想做点什么就去做。）`
             : ''
-          : '【这一轮不许再想】上次你只是想、没动手。think 今天关掉了：必须给 detail 说清楚你想了什么。',
+          : '（上次只是想了想，这次别再光想：要么做点什么，要么歇着。）',
         '',
-        (() => {
-          const cnt = todayCounts(s);
-          const cap = Math.max(0, Number(c.phoneMaxPerDay) || 100);
-          const left = Math.max(0, cap - cnt.phone);
-          return '【今天的额度】手机今天逛了 ' + cnt.phone + ' 次，剩 ' + left + ' 次' + (left > 0 ? '' : '（用完了，这一轮别选 phone）') + '。';
-        })(),
+        cantDo(s, 'phone')
+          ? ''
+          : (() => {
+              const cnt = todayCounts(s);
+              const cap = Math.max(0, Number(c.phoneMaxPerDay) || 100);
+              const left = Math.max(0, cap - cnt.phone);
+              return '【今天的额度】手机今天逛了 ' + cnt.phone + ' 次，剩 ' + left + ' 次' + (left > 0 ? '' : '（用完了，这一轮别选 phone）') + '。';
+            })(),
+        brokenList.length ? `【这些最近老是做不成，今天先别选】${brokenList.join('、')}` : '',
         '下面是你现在能做的事：',
-        '- speak：找主人说句话',
-        '- bili：去 B 站看看，找点有趣的',
-        '- diary：写点只有自己看得见的日记',
-        '- phone：拿起手机玩——手机就在桌上连着线。上面装的东西你都能用：B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机。**别只盯着 B站刷推荐**——那是最没营养的玩法。多换地方：高德看看地图上的世界、DeepSeek 问点自己真想知道的、在笔记里写两句、翻翻相册，或者打开一个你还没怎么用过的系统应用试试',
-        '- draw：给自己画一张图',
-        thinkAllowed ? '- think：认真想一件具体的、让你好奇的事' : '- think：（这一轮关掉了，别选）',
-        '- rest：今天没什么想做的了，歇着——不是发呆，是把下次醒推迟两三个小时',
-        '- idle：什么也不想干，发会儿呆',
+        `- speak：找${ownerName}说句话——detail 写具体想说什么；安排里有对应的那条就填 agendaId`,
+        cantDo(s, 'bili') ? '' : '- bili：去 B 站看看，找点有趣的',
+        cantDo(s, 'web') ? '' : '- web：自己上网查点东西——detail 写你想查什么（「最近有什么好看的冷门动画」「番茄炒蛋先放蛋还是先放番茄」），会去搜一下、点开一条看',
+        cantDo(s, 'diary') ? '' : `- diary：写一篇只给自己看的日记（一天最多 ${DIARY_MAX_PER_DAY} 篇）——detail 写想写什么`,
+        cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线。上面装的东西你都能用：B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机。**别只盯着 B站刷推荐**——那是最没营养的玩法。多换地方：高德看看地图上的世界、DeepSeek 问点自己真想知道的、在笔记里写两句、翻翻相册，或者打开一个你还没怎么用过的系统应用试试',
+        cantDo(s, 'draw') ? '' : '- draw：给自己画一张图',
+        cantDo(s, 'outing') ? '' : `- outing：出门去附近真实存在的地方（${Object.values(PLACE_KINDS).map((k) => k.label).join('、')}）——detail 写想去哪类地方、去干嘛（「去菜场买点冬笋」「去公园走走」），会挑一家真的店；今天还能出门 ${Math.max(0, OUTING_MAX_PER_DAY - (Number((s.dayCounts || {}).outing) || 0))} 次`,
+        thinkAllowed ? '- think：认真想一件让你好奇的事（光想不做，一天别太多）' : '- think：（这一轮关掉了，别选）',
+        '- rest：歇着——窝着、躺会儿、发会儿呆都算，下次晚点醒',
+        `- 生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……自己起个短名字当 action，detail 写清楚做了什么（「楼下面馆吃了碗牛肉面」）。这些算你真的过了这一段，之后聊天能提起来。${cantDo(s, 'outing') ? '' : '要出门去具体的店、公园就用 outing，会挑附近真的地方。'}`,
         '',
         '只回一个 JSON：',
-        '{"action":"上面某一个动作","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","nextMinutes":45}',
-        'kind 要老实填：软的自娱自乐写 soft，学东西写 learn，造东西写 build，其余写 other。',
-        'detail 只写一句话描述，不要写命令——系统不会执行任何 shell 命令。',
-        '手机上的红线：别碰小红书（风控会把账号踢下线）、别打开淘宝（已经卸载了，也没权限）、别动系统设置；别给真人发消息。',
-        '唯一的红线：非破坏性——别删别人的东西、别关机、别改系统配置、别联网乱发东西。',
-        '手机上的红线：别碰小红书（风控会把账号踢下线）、别打开淘宝（已经卸载了，也没权限）、别动系统设置；别给真人发消息。别的随你——搜索、点开看、记东西、在手机上留痕，都可以。',
+        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","ops":[],"nextMinutes":45}',
+        'nextMinutes 是你想大概多久后再醒（分钟）：这件事要做很久就写长点，只是歇一下就写短点，不确定就写 0。',
+        replansLeft > 0
+          ? [
+              'ops 是对今天安排的改动，没变化就给空数组，最多 3 条：',
+              '  {"op":"add","slot":"evening","what":"想做的事","why":"为什么","from":"seen"}  —— from 写 seen 表示是刚看到的东西引出来的，否则写 self',
+              '  {"op":"drop","id":"a3","why":"为什么不做了"}',
+              '  {"op":"defer","id":"a3","slot":"night","why":"为什么挪"}',
+              `比如刚刷到的东西想晚点跟${ownerName}聊，就 add 一条晚上的 speak；${ownerName}说今晚加班，就把晚上找他的那条挪后或划掉。刷 B 站时已经顺手分享过的别再排。标着「答应主人的」那几条你不能删也不能挪。`,
+            ].join('\n')
+          : '今天安排已经改过很多次了，这一轮 ops 给空数组。',
+        'kind：消遣写 soft，学东西写 learn，做出点什么写 build，其余写 other。detail 只写一句话描述。',
+        cantDo(s, 'phone') ? '' : '手机上的红线：别碰小红书（风控会把账号踢下线）、别打开淘宝、别动系统设置；别给真人发消息。',
       ].filter(Boolean).join('\n');
 
       const askArgs = {
@@ -1063,6 +2061,14 @@ export default {
           // 这一轮不许只想不做，她还非要选 think：判无效，重新要一个动作
           if (p.action === 'think' && !thinkAllowed) {
             api.log.info(`自主生活：这一轮不许只想不做，打回重新决策（why：${p.why.slice(0, 30)}）`);
+            continue;
+          }
+          // 模块没开 / 最近老失败的动作：打回换一件
+          if (cantDo(s, p.action)) {
+            const why = moduleMissing(p.action) ? '模块没开' : brokenNow(s, p.action) ? '最近连着失败' : '今天做够了';
+            api.log.info(`自主生活：「${p.action}」现在做不了（${why}），打回换一件`);
+            banned = p.action;
+            blockedForRepeat += 1;
             continue;
           }
           // 今天这件已经做够了（相似名字一并算）：硬拦，逼她换一件
@@ -1102,11 +2108,45 @@ export default {
         }
       }
 
+      // 先改表（看到的、聊到的引起的变化），再去做事
+      let agendaChanges = [];
+      if (d.ops && d.ops.length && (Number(s.agenda.replans) || 0) < REPLAN_MAX_PER_DAY) {
+        const r = applyOps(s.agenda, d.ops, { by: 'self', hour });
+        agendaChanges = r.applied;
+        if (r.applied.length) s.agenda.replans = (Number(s.agenda.replans) || 0) + 1;
+        if (r.applied.length || r.rejected.length) api.log.info(`自主生活：改安排 ${[...r.applied, ...r.rejected.map((x) => '✗ ' + x)].join('；')}`);
+      }
+      // 她说这轮在做安排里的哪一条：动作对得上才认（那条写的是 speak，这轮去刷 B 站，不算做了那条）
+      const item = d.agendaId
+        ? s.agenda.items.find((x) => x.id === d.agendaId && x.state === 'todo' && (!x.action || !STANDARD_ACTIONS.has(x.action) || x.action === d.action)) || null
+        : null;
+
       let result = { note: '', extra: {} };
       try {
-        result = await act(d);
+        result = await act(d, s);
       } catch (error) {
-        result = { note: `动作失败：${error.message}`, extra: {} };
+        result = { note: `动作失败：${error.message}`, extra: { ok: false } };
+      }
+
+      noteOutcome(s, d.action, !(result.extra && result.extra.ok === false) || !!(result.extra && result.extra.later));
+      // 精力、心情跟着这件事走一点
+      {
+        const okDone = !(result.extra && result.extra.ok === false);
+        if (okDone) addEnergy(s, energyDelta(d.action, `${d.action} ${d.detail || ''} ${result.note || ''}`));
+        if (!okDone && !(result.extra && result.extra.later) && d.action !== 'speak') moodNudge(-2, `想${clip(d.detail || d.action, 12)}没做成`);
+        else if (okDone && ['bili', 'web', 'draw'].includes(d.action) && Math.random() < 0.5) moodNudge(2, `${clip((result.extra && result.extra.life ? result.note : '') || d.detail || d.action, 14)}`);
+        else if (okDone && result.extra && result.extra.life && Math.random() < 0.4) moodNudge(1, clip(result.note, 14));
+      }
+      // 安排里那条：做成了就勾掉；没做成留着，记一下卡在哪
+      if (item && !['think', 'rest', 'idle'].includes(d.action)) {
+        if (result.extra && result.extra.ok === false) {
+          item.note = clip(result.note, 40);
+          item.tries = (Number(item.tries) || 0) + 1;
+        } else {
+          item.state = 'done';
+          item.note = clip(result.note, 60);
+          item.doneAt = Date.now();
+        }
       }
 
       // 只想不做的一轮（dry）：不算「手上在弄的事」，也不进记忆库 —— 否则提示词会一直催她接着「想」
@@ -1114,9 +2154,18 @@ export default {
       // 歇着不是发呆：真的把下次醒推远，两小时起步，最多五小时
       const resting = d.action === 'rest';
       const at = Date.now();
-      const delay = resting
+      // 精力低就醒得少一点，精神好就勤一点
+      const ev = s.energy ? energyNow(s) : 60;
+      const energyFactor = ev < 30 ? 1.4 : ev > 75 ? 0.85 : 1;
+      const baseDelay = resting
         ? Math.max(120, Math.min(300, Math.round(nextWakeDelay(c) * 3)))
-        : nextWakeDelay(c);
+        : Math.round(nextWakeDelay(c) * energyFactor);
+      // 她自己说想多久后再醒：只在作息算出来的值上下浮动一半，不让它绕过作息表
+      const wantMin = Number(d.nextMinutes) || 0;
+      let delay = wantMin > 0 ? Math.round(Math.max(baseDelay * 0.5, Math.min(baseDelay * 1.5, wantMin))) : baseDelay;
+      // 出门了：回来之前别醒
+      const awayMin = Number(result && result.extra && result.extra.busyMin) || 0;
+      if (awayMin > 0) delay = Math.max(delay, awayMin + 3);
       s.wakes += 1;
       s.thinkToday = (Number(s.thinkToday) || 0) + (dry ? 1 : 0);
       // 连续性：连续做同一件事就把它当成「手上在弄的项目」，下次提示词会催她接着做。
@@ -1137,6 +2186,16 @@ export default {
           s.project = { name: d.action, times: 1, lastNote: String(result.note || '').slice(0, 80), at };
         }
       }
+      // 生活里的事写进记忆（做过的事），聊天时她能想起来「刚吃了碗面」；节流 15 分钟
+      if (result.extra && result.extra.life && Date.now() - (Number(s.lastLifeMemoAt) || 0) > 15 * 60_000) {
+        try {
+          const mem = api.use('memory');
+          if (mem && typeof mem.addEvent === 'function') {
+            mem.addEvent({ text: clip(result.note, 120), tags: ['自主生活', '生活'], importance: 0.35 });
+            s.lastLifeMemoAt = Date.now();
+          }
+        } catch (error) {}
+      }
       // 手机上做的活动也写进记忆库，这样 QQ 上聊起来能接上
       // 节流 20 分钟：她一天醒上百次，不节流会把记忆库灌爆
       const isVmAction =
@@ -1146,7 +2205,7 @@ export default {
           const mem = api.use('memory');
           if (mem && typeof mem.add === 'function') {
             mem.add({
-              text: `我在自己的 Linux 机器上${result.note ? '：' + String(result.note).slice(0, 160) : '做了点事'}`,
+              text: String(result.note || '').slice(0, 160) || (d.action === 'draw' ? '画了张图' : '玩了会儿手机'),
               tags: [d.action],
               importance: 0.5,
               source: 'autonomy',
@@ -1163,13 +2222,19 @@ export default {
       // 当天动作累计：额度按这个数（done 只留 50 条，拿它数额度会越算越少）
       if (!s.dayCounts || typeof s.dayCounts !== 'object') s.dayCounts = {};
       s.dayCounts[d.action] = (Number(s.dayCounts[d.action]) || 0) + 1;
+      // 这件事要忙一阵：这期间来私聊会晚点回（reply/hold）
+      if (!(result.extra && result.extra.ok === false)) {
+        const mins = Number(result.extra && result.extra.busyMin) || busyMinutes(d.action, `${d.action} ${d.detail || ''} ${result.note || ''}`);
+        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24) };
+      }
       s.done = [
-        { at, action: d.action, note: String(result.note || '').slice(0, 100), dry, kind: d.kind || '' },
+        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', ...(item ? { agendaId: item.id } : {}) },
         ...(s.done || []),
       ].slice(0, 50);
       // 空想和歇着都不覆盖「留给自己的话」——否则那句话会在下次提示词里自己喂自己
       if (!dry && !resting) s.note = d.why || '';
       s.nextWakeAt = at + delay * 60_000;
+      mergeOwnerEdits(s, readJson(stateFile(), null));
       save(s);
 
       appendLog({
@@ -1180,6 +2245,8 @@ export default {
         note: result.note,
         output: result.extra && result.extra.output ? String(result.extra.output).slice(0, 600) : '',
         nextMinutes: delay,
+        ...(item ? { agendaId: item.id } : {}),
+        ...(agendaChanges.length ? { agenda: agendaChanges } : {}),
       });
 
       api.log.info(`自主生活：${d.action} —— ${result.note}（下次 ${delay} 分钟后）`);
@@ -1196,6 +2263,78 @@ export default {
       if (!c.enabled) return;
       if (waking) return; // 上一轮还没结束，这一分钟的 tick 直接跳过
       const s = load();
+      try {
+        await catchUpHeld(s);
+        if (await catchUpGroups(s)) save(s);
+      } catch (error) {
+        api.log.warn('自主生活：补回晚回消息出错 ' + error.message);
+      }
+      // 精力（今天第一次醒着时定个起点）、天气（两小时一次）
+      {
+        const hadEnergy = s.energy && s.energy.day === dayKey();
+        ensureEnergy(s, c);
+        const wChanged = await refreshWeather(s);
+        if (wChanged || (!hadEnergy && s.energy)) save(s);
+      }
+      // 安排里到点的事（吃饭这类）
+      if (tickTimedItems(s, c)) save(s);
+      // 出门回来：写经历；要发的照片
+      try {
+        if (s.outing && Date.now() >= s.outing.returnAt) {
+          waking = true;
+          try {
+            await finishOuting(s);
+          } finally {
+            waking = false;
+          }
+          save(s);
+        }
+        if (await tickPendingShare(s)) save(s);
+      } catch (error) {
+        api.log.warn('自主生活：发出门照片出错 ' + error.message);
+      }
+      // 睡前例行：离睡觉不到 40 分钟、今天还没走过这一步
+      if (isAwakeHour(c) && s.bedtimeDay !== dayKey()) {
+        const sleepAt = nextSleepAt(c);
+        if (sleepAt && sleepAt - Date.now() <= 40 * 60_000) {
+          s.bedtimeDay = dayKey();
+          save(s);
+          waking = true;
+          try {
+            await bedtime(s, c);
+          } catch (error) {
+            api.log.warn('自主生活：睡前例行出错 ' + error.message);
+          } finally {
+            waking = false;
+          }
+          return;
+        }
+      }
+      // 和主人约好几点的事：到点直接在私聊里叫她开口（不经过决策，不受活跃时段、次数限制）
+      if (!s.lastSeenAt || Date.now() - Number(s.lastSeenAt) > 5 * 60_000) {
+        s.lastSeenAt = Date.now();
+        save(s);
+      }
+      const due = (s.timers || []).find((t) => !t.fired && t.at <= Date.now());
+      if (due) {
+        due.fired = true;
+        save(s);
+        // 电脑关着错过了：晚太久（12 小时以上）就算了；晚了半小时以上，换成「现在才想起来」的说法
+        const overdue = Date.now() - Number(due.at);
+        if (overdue > 12 * 3600_000) {
+          appendLog({ at: Date.now(), action: 'timer', why: due.why || '', detail: due.what, note: `错过了（${clock(due.at)} 那会儿不在），没补` });
+          api.log.info(`自主生活：定时提醒「${due.what}」错过太久，不补了`);
+          return;
+        }
+        try {
+          const r = await reachOwner(s, { what: due.what, why: due.why, promise: true, timed: true, followup: due.kind === 'followup', lateFrom: overdue > 30 * 60_000 ? due.at : 0 });
+          appendLog({ at: Date.now(), action: 'timer', why: due.why || '', detail: due.what, note: r.note });
+          api.log.info(`自主生活：定时提醒「${due.what}」—— ${r.note}`);
+        } catch (error) {
+          api.log.warn('自主生活：定时提醒没发出去 ' + error.message);
+        }
+        return;
+      }
       if (!s.nextWakeAt) {
         s.nextWakeAt = Date.now() + nextWakeDelay(c) * 60_000;
         save(s);
@@ -1213,6 +2352,36 @@ export default {
     }, '补活动流水');
 
     api.later(25_000, () => {
+    });
+
+    // 出门的照片：主人私聊里想看她在的 / 今天去过的地方
+    api.tool(({ chat, level } = {}) => {
+      if (level !== 'full' || !chat || chat.kind !== 'private') return [];
+      return [
+        api.defineTool({
+          name: 'outing_photo',
+          description: '主人想看你现在在外面的地方、或者今天去过的那家店的样子时用：发一张那儿的照片给他。没出门、没有照片就照实说。',
+          properties: {},
+          execute: async () => {
+            const s = load();
+            const cur = s.outing && s.outing.returnAt > Date.now() ? { name: s.outing.place.name, file: s.outing.photoFile } : null;
+            const last = !cur && s.lastOuting && s.lastOuting.day === dayKey() ? { name: s.lastOuting.name, file: s.lastOuting.photoFile } : null;
+            const t = cur || last;
+            if (!t) return { ok: false, message: '你今天还没出过门，没有照片可发。照实说就好。' };
+            if (!t.file || !fs.existsSync(t.file)) return { ok: false, message: `${t.name}在地图上没有照片，发不了。别说发了；照实说没拍到 / 没有就好。` };
+            try {
+              await api.sendImage(chat.chatId || `private:${chat.userId}`, t.file);
+            } catch (error) {
+              return { ok: false, message: '照片没发出去：' + error.message };
+            }
+            try {
+              const mem = api.use('memory');
+              if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: `主人要看，发了${t.name}的照片（是地图上这家店的图，不是自己拍的）`, tags: ['自主生活', '出门'], importance: 0.3 });
+            } catch (error) {}
+            return { ok: true, message: `照片已经发出去了（${t.name}）。这张其实是地图上这家店的图：不用主动说明来源，他问是不是你拍的，就照实说是地图上找的。接着用你自己的口气说一两句。` };
+          },
+        }),
+      ];
     });
 
     // 她自己的节奏控制：聊着天就能改自己的作息
@@ -1272,7 +2441,11 @@ export default {
               api.saveSettings(patch);
               api.log.info('自主生活被调整：' + JSON.stringify(patch));
             }
-            if (Array.isArray(a.plan)) s.plan = a.plan.map((x) => String(x).slice(0, 40)).slice(0, 8);
+            if (Array.isArray(a.plan)) {
+              // 老参数：现在写进今天的安排（她自己的事）
+              for (const x of a.plan.slice(0, 5)) addItem(s.agenda, { what: String(x), from: 'self' });
+              s.agenda.planned = true;
+            }
             if (Number(a.nextMinutes) > 0) {
               s.nextWakeAt = Date.now() + Math.max(3, Math.min(360, Number(a.nextMinutes))) * 60_000;
             }
@@ -1287,6 +2460,7 @@ export default {
             return {
               ok: true,
               message: Object.keys(patch).length ? '改好了，已经生效' : '看过了',
+              今天的安排: agendaBlock(s.agenda, { timers: s.timers }),
               now: {
                 开关: c2.enabled ? '开' : '关',
                 间隔: `${c2.minInterval}~${c2.maxInterval} 分钟随机`,
@@ -1300,7 +2474,559 @@ export default {
             };
           },
         }),
+        api.defineTool({
+          name: 'my_diary',
+          description: '翻翻你自己的日记（只给自己看的）。想回忆前几天在想什么、心情怎么样时用。翻到的内容是你的私事：别人想看时别整篇给，最多说个大意。',
+          properties: {
+            count: { type: 'number', description: '翻最近几篇，默认 2，最多 5' },
+          },
+          execute: async (args) => {
+            const n = Math.max(1, Math.min(5, Math.round(Number((args || {}).count) || 2)));
+            const list = diaryRecent(n);
+            if (!list.length) return { ok: true, message: '日记本还是空的' };
+            return { ok: true, message: '（只给你自己看的）\n' + list.map((x) => `【${x.day} ${x.time}】\n${x.text}`).join('\n\n') };
+          },
+        }),
+        api.defineTool({
+          name: 'my_agenda',
+          description:
+            '看或改你今天的安排。和主人约了事（「晚上陪我聊聊那部番」「今天别等我了」「十点提醒我睡觉」「明早八点叫我」）就用它记下或改掉，别只是嘴上答应。' +
+            '用 add 记下的会标成「答应主人的」，你自己在后台不会删它。约了具体几点的写 time，到点系统会叫你去跟他说。' +
+            '他说到之后的事（面试、考试、看病、出差、交稿）、身体不舒服或者在烦的事，用 add + kind=followup 记下之后去问问，day/time 写什么时候问合适。',
+          properties: {
+            action: { type: 'string', description: 'show=看今天的安排；add=加一条；drop=划掉；defer=挪到别的时段；done=标成做完' },
+            what: { type: 'string', description: 'add 时：要做的事，20 字以内（比如「陪他聊那部番」「提醒他睡觉」）' },
+            why: { type: 'string', description: '一句话缘由，可空' },
+            slot: { type: 'string', description: '时段：morning/afternoon/evening/night（上午/下午/晚上/深夜）。defer 时是挪到哪' },
+            time: { type: 'string', description: '约了准点才填，比如「22:00」「晚上10点」「8点半」；过了今天这个点就算明天' },
+            day: { type: 'number', description: '哪天：0 今天、1 明天、2 后天……（跟进别人的事常用）' },
+            kind: { type: 'string', description: 'promise=答应他的事（默认）；followup=惦记着他的事、之后去问问（面试怎么样了、病好点没）' },
+            id: { type: 'string', description: 'drop/defer/done 时：条目编号，比如 a3（先 show 看编号）' },
+          },
+          execute: async (args) => {
+            const a = args || {};
+            const op = String(a.action || 'show').toLowerCase();
+            const s = load();
+            let message = '看过了';
+            const followup = String(a.kind || '').toLowerCase() === 'followup';
+            if (op === 'add' && (a.time || followup || Number(a.day) > 0)) {
+              const at = parseWhen(a.time, a.day);
+              if (!at) return { ok: false, message: `时间「${a.time}」没看懂，写成 22:00 这样` };
+              const what = clip(a.what, 40);
+              if (!what) return { ok: false, message: '要提醒什么没写' };
+              const dup = (s.timers || []).find((t) => !t.fired && t.kind === (followup ? 'followup' : undefined) && t.what === what);
+              if (dup) return { ok: true, message: '这件事已经记过了', 今天的安排: agendaBlock(s.agenda, { timers: s.timers }) };
+              s.timers = [...(s.timers || []), { id: 't' + Date.now().toString(36), at, what, why: clip(a.why, 40), fired: false, ...(followup ? { kind: 'followup' } : {}) }];
+              message = `记下了：${new Date(at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })} ${what}`;
+            } else if (op === 'drop' && !a.id && a.what) {
+              // 主人说「不用提醒了」：按内容找定时的那条
+              const t = (s.timers || []).find((x) => !x.fired && x.what.includes(clip(a.what, 10)));
+              if (t) {
+                t.fired = true;
+                message = `取消了定时：${t.what}`;
+              } else message = '没找到对应的条目，先 show 看编号';
+            } else if (op !== 'show') {
+              const r = applyOps(s.agenda, [{ op, id: a.id, slot: a.slot, what: a.what, why: a.why }], { by: 'owner' });
+              message = [...r.applied, ...r.rejected].join('；') || '没有变化';
+              if (!r.applied.length) return { ok: false, message, 今天的安排: agendaBlock(s.agenda, { timers: s.timers }) };
+            }
+            save(s);
+            api.log.info(`自主生活：主人那边改安排（${op}）—— ${message}`);
+            return { ok: true, message, 今天的安排: agendaBlock(s.agenda, { timers: s.timers }) };
+          },
+        }),
       ];
+    });
+
+    // 聊天时（只在主人私聊）塞一句：刚才在干嘛、接下来想干嘛。不念整张表
+    api.context(({ chat } = {}) => {
+      try {
+        if (!cfg().enabled || !chat || chat.kind !== 'private') return '';
+        const { qq } = ownerOf();
+        if (!qq || String(chat.userId) !== qq) return '';
+        const s = load();
+        const last = (s.done || []).find((x) => !x.dry && !['rest', 'idle', 'speak', 'timer'].includes(x.action));
+        const parts = [statusLine(s.agenda, last, { clockOf: clock, busy: s.busy })];
+        if (s.energy && isAwakeHour(cfg())) {
+          const v = energyNow(s);
+          if (v < 35) parts.push(`【精力】你${energyLabel(v)}，回话会懒一点、短一点（别句句喊困）。`);
+        }
+        if (s.outing && s.outing.returnAt > Date.now()) {
+          const p = s.outing.place;
+          parts.push(`【在外面】你${clock(s.outing.departAt)}出的门，现在人在外面（${p.name}${s.outing.wish ? '，出门是想' + clip(s.outing.wish, 20) : ''}），大概 ${clock(s.outing.returnAt)} 到家。是拿手机回的，回得短一点；还没逛完，别说成已经回家了，也别说已经买好了什么。${s.outing.photoFile ? '他想看这儿的样子，可以用 outing_photo 发张照片。' : ''}`);
+        } else if (s.lastOuting && s.lastOuting.day === dayKey() && s.lastOuting.photoFile && Date.now() - s.lastOuting.backAt < 6 * 3600_000) {
+          parts.push(`【出门】你今天去过${s.lastOuting.name}，他想看那儿的样子可以用 outing_photo 发张照片。`);
+        }
+        if (s.weather && s.weather.now) parts.push(`【天气】${weatherLine(s.weather, { full: false })}${weatherNotable(s.weather) ? '。聊到相关的可以顺口提一句（比如提醒带伞、多穿点），别专门播报' : '。不用主动提'}`);
+        return parts.filter(Boolean).join('\n');
+      } catch (error) {
+        return '';
+      }
+    });
+
+    // ── 忙的时候晚点回（reply/hold，需要插件核心带这个事件）────────────────
+    // 判断时机：只在「开启一段新对话」时可能晚回；正聊着（10 分钟内有来回）、急事一律照常。
+    // 晚回期间对方再发的会被核心攒在一起；回来那一轮在提示词前面补一句「刚才在干嘛、现在才看到」。
+    const HOLD_TALKING_MS = 10 * 60_000;
+    const lastOut = new Map(); // chatId → 她最后一次在这个私聊说话的时间
+    api.on('activity', (a) => {
+      if (a && a.kind === 'out' && a.chatId) lastOut.set(a.chatId, Date.now());
+    });
+    const randMin = (lo, hi) => Math.round((lo + Math.random() * (hi - lo)) * 60_000);
+    const isAwakeHour = (c, hour = new Date().getHours()) => {
+      const from = Number(c.awakeFrom) || 0;
+      const to = Number(c.awakeTo) || 24;
+      return from <= to ? hour >= from && hour < to : hour >= from || hour < to;
+    };
+    /** 下一次「几点开始活跃」的时间点 */
+    function nextAwakeAt(c, now = Date.now()) {
+      const d = new Date(now);
+      d.setMinutes(0, 0, 0);
+      for (let i = 0; i < 48; i += 1) {
+        d.setHours(d.getHours() + 1);
+        if (isAwakeHour(c, d.getHours())) return d.getTime();
+      }
+      return now + 8 * 3600_000;
+    }
+    /** 下一次「几点睡觉」（离开活跃时段）的时间点；全天都醒着返回 0 */
+    function nextSleepAt(c, now = Date.now()) {
+      const d = new Date(now);
+      d.setMinutes(0, 0, 0);
+      for (let i = 0; i < 48; i += 1) {
+        d.setHours(d.getHours() + 1);
+        if (!isAwakeHour(c, d.getHours())) return d.getTime();
+      }
+      return 0;
+    }
+
+    /** 睡前：写篇日记，然后去洗漱睡觉（这段时间来消息算在忙） */
+    async function bedtime(s, c) {
+      const sleepAt = nextSleepAt(c) || Date.now() + 40 * 60_000;
+      let note = '准备睡了';
+      if (isGranted(api.settings(), 'model') && diaryCount(ymd(Date.now())) < DIARY_MAX_PER_DAY) {
+        try {
+          const r = await writeLocalDiary({ detail: '睡前，回头想想今天' }, s);
+          note = r.note;
+        } catch (error) {
+          note = '睡前想写日记，没写成：' + error.message;
+        }
+      }
+      s.busy = { since: Date.now(), until: sleepAt, what: '洗漱准备睡觉' };
+      s.nextWakeAt = nextAwakeAt(c, sleepAt) + randMin(0, 30);
+      save(s);
+      appendLog({ at: Date.now(), action: 'bedtime', why: '快到睡觉时间了', detail: '', note });
+      api.log.info(`自主生活：睡前 —— ${note}（明早 ${clock(s.nextWakeAt)} 左右醒）`);
+    }
+
+    /**
+     * 安排里带时间的条目（吃饭、午睡这类）：到点了——
+     *   · 生活里的事（自己起名的动作）直接当她在做：勾掉、这段时间算忙、记进记忆；
+     *   · 其他动作（刷 B 站这类）提前叫醒她一次，由她决定做不做。
+     */
+    // ── 精力：起床时比较满，醒着慢慢往下掉，吃饭歇着能回一点 ─────────────
+    function ensureEnergy(s, c) {
+      if (!isAwakeHour(c)) return s.energy || null;
+      if (!s.energy || s.energy.day !== dayKey()) s.energy = { day: dayKey(), value: Math.round(65 + Math.random() * 25), at: Date.now() };
+      return s.energy;
+    }
+    const energyNow = (s) => energyAt(s.energy);
+    function addEnergy(s, d) {
+      if (!s.energy || !d) return;
+      s.energy = { ...s.energy, value: Math.max(5, Math.min(100, energyAt(s.energy) + d)), at: Date.now() };
+    }
+    function energyPrompt(s) {
+      if (!s.energy) return '';
+      const v = Math.round(energyNow(s));
+      return `你现在的精力：${energyLabel(v)}（${v}/100）${v < 40 ? '——累了就歇着，或者做点不费劲的' : ''}`;
+    }
+
+    // ── 心情：她自己做的事也会让心情起一点小波澜 ─────────────────────
+    function moodNudge(d, reason) {
+      try {
+        const m = api.use('mood');
+        if (m && typeof m.nudge === 'function' && d) m.nudge(d, reason);
+      } catch (error) {}
+    }
+
+    // ── 天气（Open-Meteo）：两小时更新一次 ─────────────────────────
+    let weatherBusy = false;
+    async function refreshWeather(s) {
+      const c = cfg();
+      const city = String(c.weatherCity || '').trim();
+      if (!city || weatherBusy) return false;
+      if (s.weather && Date.now() - Number(s.weather.at || 0) < 2 * 3600_000) return false;
+      weatherBusy = true;
+      try {
+        let lat = Number(c.weatherLat);
+        let lon = Number(c.weatherLon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || (!lat && !lon)) {
+          const g = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=zh`, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
+          const hit = g && Array.isArray(g.results) ? g.results[0] : null;
+          if (!hit) throw new Error(`没查到城市「${city}」`);
+          lat = hit.latitude;
+          lon = hit.longitude;
+          api.saveSettings({ weatherLat: lat, weatherLon: lon });
+        }
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=2`;
+        const j = await fetch(url, { signal: AbortSignal.timeout(8000) }).then((r) => r.json());
+        const w = parseWeather(j, city);
+        if (!w) throw new Error('天气数据格式不对');
+        const before = s.weather;
+        s.weather = { ...w, at: Date.now() };
+        // 天气对心情的小影响：刚下起雨来低落一点；天晴又舒服（一天一次）开心一点
+        if (isWet(w.now.code) && !(before && before.now && isWet(before.now.code))) moodNudge(-2, `${city}下起${w.now.text}了`);
+        else if (Number(w.now.code) <= 1 && w.now.temp >= 15 && w.now.temp <= 26 && s.weatherMoodDay !== dayKey()) {
+          s.weatherMoodDay = dayKey();
+          moodNudge(2, '天气挺好');
+        }
+        api.log.info(`自主生活：天气 —— ${weatherLine(s.weather)}`);
+        return true;
+      } catch (error) {
+        api.log.warn('自主生活：查天气失败 ' + error.message);
+        if (s.weather) s.weather.at = Date.now() - 90 * 60_000; // 半小时后再试
+        else s.weather = { at: Date.now() - 90 * 60_000 };
+        return true;
+      } finally {
+        weatherBusy = false;
+      }
+    }
+
+    function tickTimedItems(s, c) {
+      const now = Date.now();
+      const item = (s.agenda.items || []).find((x) => x.at && x.state === 'todo' && !x.timedFired && x.at <= now && x.at > now - 60 * 60_000);
+      if (!item || !isAwakeHour(c)) return false;
+      item.timedFired = true;
+      const life = !item.action || !STANDARD_ACTIONS.has(item.action);
+      if (!life) {
+        if (!s.nextWakeAt || s.nextWakeAt > now + 2 * 60_000) s.nextWakeAt = now;
+        return true;
+      }
+      const mins = busyMinutes(item.action || 'life', `${item.action} ${item.what}`);
+      item.state = 'done';
+      item.note = item.what;
+      item.doneAt = now;
+      s.busy = { since: now, until: now + mins * 60_000, what: item.what };
+      addEnergy(s, energyDelta(item.action || 'life', `${item.action} ${item.what}`));
+      if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
+      s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id }, ...(s.done || [])].slice(0, 50);
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: item.what, tags: ['自主生活', '生活'], importance: 0.3 });
+      } catch (error) {}
+      appendLog({ at: now, action: item.action || 'life', why: '安排里定了这个点', detail: '', note: item.what, agendaId: item.id });
+      api.log.info(`自主生活：${item.what}（${mins} 分钟）`);
+      return true;
+    }
+
+    const heldOf = (s) => (s.held && typeof s.held === 'object' ? s.held : (s.held = {}));
+
+    /**
+     * 睡着时来消息，被吵醒的概率：基础 5%，每多一条 +10%，像急事 +25%，主人 +5%；
+     * 后半夜睡得沉、快起床时睡得浅；睡前越累睡得越死；心情好更愿意起来理人，心情差更不想理。最高 85%。
+     */
+    function wakeChance(s, c, { count = 1, urgent = false, owner = false } = {}) {
+      let p = 0.05 + 0.1 * Math.max(0, count - 1) + (urgent ? 0.25 : 0) + (owner ? 0.05 : 0);
+      const h = new Date().getHours();
+      const toWake = (nextAwakeAt(c) - Date.now()) / 3600_000;
+      if (toWake <= 1) p *= 1.6;
+      else if (h >= 1 && h < 5) p *= 0.6;
+      const e = s.energy ? Number(s.energy.value) : 60; // 用睡前那一刻的精力（夜里不再往下算）
+      if (e < 30) p *= 0.6;
+      else if (e > 70) p *= 1.2;
+      try {
+        const m = api.use('mood');
+        const v = m && typeof m.current === 'function' ? Number(m.current()) : NaN;
+        if (v > 70) p *= 1.2;
+        else if (v < 45) p *= 0.7;
+      } catch (error) {}
+      return Math.max(0, Math.min(0.85, p));
+    }
+    /** 被吵醒：有点起床气，精力掉一截 */
+    function wokenUp(s, where) {
+      moodNudge(-3, '睡着被吵醒了');
+      addEnergy(s, -8);
+      api.log.info(`自主生活：在${where}被吵醒了`);
+    }
+    const isAsleep = () => {
+      const c = cfg();
+      return !!c.enabled && c.delayReplies !== false && !isAwakeHour(c);
+    };
+
+    api.on('reply/hold', (ms, info) => {
+      try {
+        const c = cfg();
+        if (!c.enabled || c.delayReplies === false || !info || !info.chatId) return undefined;
+        const now = Date.now();
+        const s = load();
+        const held = heldOf(s);
+        const h = held[info.chatId];
+        // 已经在晚回：再来一条。急事 / 连着发了好几条 → 放下手里的事先回
+        if (h && info.heldUntil > now) {
+          h.count = (Number(h.count) || 1) + 1;
+          if (h.reason === 'sleep' && !h.woken) {
+            const p = wakeChance(s, c, { count: h.count, urgent: isUrgent(info.text), owner: !!info.owner });
+            if (Math.random() < p) {
+              h.woken = true;
+              h.until = now + randMin(0.5, 2);
+              wokenUp(s, '私聊');
+              save(s);
+              return h.until - now;
+            }
+            save(s);
+            return Math.max(0, info.heldUntil - now);
+          }
+          if ((isUrgent(info.text) || h.count >= 4) && !h.woken) {
+            h.woken = true;
+            h.until = now + randMin(0.5, 1.5);
+            save(s);
+            api.log.info(`自主生活：${info.chatId} 看着挺急 / 连发了 ${h.count} 条，提前回`);
+            return h.until - now;
+          }
+          save(s);
+          return Math.max(0, info.heldUntil - now);
+        }
+        const last = Math.max(Number(info.lastInAt) || 0, Number(info.lastOutAt) || 0, lastOut.get(info.chatId) || 0);
+        if (now - last < HOLD_TALKING_MS) return 0; // 正聊着（夜里也是：被吵醒之后接着聊）
+        let until = 0;
+        let reason = '';
+        let what = '';
+        if (!isAwakeHour(c)) {
+          // 睡着了：这一条有一点概率把她吵醒，没醒就等明早醒了顺带回
+          if (Math.random() < wakeChance(s, c, { count: 1, urgent: isUrgent(info.text), owner: !!info.owner })) {
+            held[info.chatId] = { since: now, until: now + randMin(0.5, 2), reason: 'sleep', what: '', count: 1, woken: true, userId: String(info.userId || '') };
+            wokenUp(s, '私聊');
+            save(s);
+            return held[info.chatId].until - now;
+          }
+          until = nextAwakeAt(c, now) + randMin(5, 60);
+          reason = 'sleep';
+        } else if (isUrgent(info.text)) {
+          return 0;
+        } else if (s.outing && s.outing.returnAt > now) {
+          // 在外面：手机在身上，过几分钟看到就回
+          if (Math.random() < 0.3) return 0;
+          until = now + randMin(2, 10);
+          reason = 'busy';
+          what = `外面（${s.outing.place.name}）`;
+        } else if (s.busy && s.busy.until > now && Math.random() < 0.85) {
+          until = Math.min(s.busy.until + randMin(1, 5), now + 45 * 60_000);
+          reason = 'busy';
+          what = s.busy.what || '';
+        } else if (Math.random() < 0.2) {
+          until = now + randMin(1, 4);
+          reason = 'away';
+        }
+        if (!until) return 0;
+        held[info.chatId] = { since: now, until, reason, what, count: 1, userId: String(info.userId || '') };
+        save(s);
+        api.log.info(`自主生活：${info.chatId} 的消息晚点回（${reason === 'sleep' ? '睡着了' : reason === 'busy' ? '在' + what : '没看手机'}，约 ${Math.round((until - now) / 60_000)} 分钟后）`);
+        return until - now;
+      } catch (error) {
+        api.log.warn('自主生活：判断晚回出错 ' + error.message);
+        return undefined;
+      }
+    });
+
+    // ── 群里也一样：睡着时被叫到不立刻回，有概率被吵醒；没醒的明早醒了顺带回 ─────────
+    const groupWoken = new Map(); // chatId → 被吵醒的时间（交给她时补一句）
+    api.on('group/decide', (decision, { msg } = {}) => {
+      try {
+        if (!isAsleep() || !msg || !msg.groupId || !decision || !decision.reply) return undefined;
+        if (Date.now() - (lastOut.get(`group:${msg.groupId}`) || 0) < HOLD_TALKING_MS) return undefined; // 被吵醒后正聊着
+        // 另一个机器人说话不吵醒她（机器人同伴模块那边也会拦）
+        try {
+          const bp = api.use('bot-peers');
+          const ps = bp && typeof bp.peers === 'function' ? bp.peers() : [];
+          if (ps.some((p) => p.id === String(msg.userId))) return { reply: false, reason: '睡着了（同伴机器人说话不吵醒她）' };
+        } catch (error) {}
+        const c = cfg();
+        const s = load();
+        const hg = (s.heldGroups && typeof s.heldGroups === 'object' ? s.heldGroups : (s.heldGroups = {}));
+        const gid = String(msg.groupId);
+        const e = hg[gid] || (hg[gid] = { since: Date.now(), rows: [], count: 0 });
+        e.count += 1;
+        e.rows = [...e.rows, { t: Date.now(), who: clip(msg.nickname || msg.userId, 16), text: clip(msg.text, 80) }].slice(-8);
+        const p = wakeChance(s, c, { count: e.count, urgent: isUrgent(msg.text), owner: api.isOwner(msg.userId) });
+        if (Math.random() < p) {
+          delete hg[gid];
+          groupWoken.set(`group:${gid}`, Date.now());
+          wokenUp(s, '群里');
+          save(s);
+          return undefined; // 醒了：照常回
+        }
+        save(s);
+        return { reply: false, reason: `睡着了（第 ${e.count} 条，吵醒概率 ${Math.round(p * 100)}%）` };
+      } catch (error) {
+        return undefined;
+      }
+    });
+
+    /** 醒来以后：把夜里群里叫她、她没回的那些顺带回一下（醒来后 5~40 分钟） */
+    async function catchUpGroups(s) {
+      if (!isAwakeHour(cfg())) return false;
+      const hg = s.heldGroups && typeof s.heldGroups === 'object' ? s.heldGroups : null;
+      if (!hg || !Object.keys(hg).length) return false;
+      const now = Date.now();
+      if (!s.groupCatchupAt || s.groupCatchupAt < Math.max(...Object.values(hg).map((x) => Number(x.since) || 0))) {
+        s.groupCatchupAt = now + randMin(5, 40);
+        return true;
+      }
+      if (now < s.groupCatchupAt) return false;
+      const g = api.config() || {};
+      const h = hub();
+      const [gid, e] = Object.entries(hg)[0];
+      delete hg[gid];
+      if (!Object.keys(hg).length) s.groupCatchupAt = 0;
+      if (!g.enabled || !h || typeof h.pushToSession !== 'function' || !e || !e.rows || !e.rows.length) return true;
+      const lines = e.rows.map((r) => `${fmtHM(r.t)} ${r.who}：${r.text}`).join('\n');
+      const text = `【系统提醒，不是群里谁说的话】你睡着的时候，群里有人叫你 / 找你，你都没看到：\n${lines}\n你刚醒，顺带回一下：挑想回的回，可以一句带过，也可以自然说一句刚醒才看到。`;
+      try {
+        await h.pushToSession({ chatId: `group:${gid}`, kind: 'group', groupId: gid, userId: '', nickname: '' }, [{ type: 'text', text }], '');
+        appendLog({ at: now, action: 'catchup', why: 'sleep', detail: lines, note: `醒来顺带回了群里 ${e.rows.length} 条` });
+        api.log.info(`自主生活：醒来顺带回群 ${gid} 夜里的 ${e.rows.length} 条`);
+      } catch (error) {
+        api.log.warn('自主生活：醒来回群消息失败 ' + error.message);
+      }
+      return true;
+    }
+
+    // 晚回的那一轮真交给她时：前面补一句刚才在干嘛
+    api.on('prompt', (content, info = {}) => {
+      try {
+        const chat = info.chat || {};
+        if (chat.kind === 'group' && Array.isArray(content) && groupWoken.has(chat.chatId)) {
+          const at = groupWoken.get(chat.chatId);
+          groupWoken.delete(chat.chatId);
+          if (Date.now() - at < 10 * 60_000) return [{ type: 'text', text: '【系统提示，不是群里谁说的话】你本来睡着了，被群里的消息吵醒，迷迷糊糊的、有点起床气。回得短一点，可以带一句被吵醒了。' }, ...content];
+          return undefined;
+        }
+        if (chat.kind !== 'private' || !Array.isArray(content)) return undefined;
+        const first = content.find((x) => x && x.type === 'text');
+        if (first && /^【系统提醒/.test(String(first.text || ''))) return undefined; // 她自己主动开口的那种，不是晚回
+        const s = load();
+        const held = heldOf(s);
+        const h = held[chat.chatId];
+        if (!h || Date.now() < h.until - 5_000) return undefined;
+        delete held[chat.chatId];
+        save(s);
+        const mins = Math.max(1, Math.round((Date.now() - h.since) / 60_000));
+        const ago = mins >= 90 ? `${clock(h.since)} 发的` : `${mins} 分钟前发的`;
+        const head =
+          h.woken && h.reason === 'sleep'
+            ? '你本来睡着了，被对方的消息吵醒，迷迷糊糊的、有点起床气，回得短一点'
+            : h.woken
+            ? `对方连着发了好几条 / 看着有点急，你放下手里的事（${h.what || '刚才在忙'}）先回`
+            : h.reason === 'sleep'
+              ? `你刚睡醒才看到这些消息（最早一条是 ${ago}），顺带回一下就好`
+              : h.reason === 'busy'
+                ? `你刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
+                : `你刚才没看手机，现在才看到（最早一条是 ${ago}）`;
+        const note = `【系统提示，不是对方说的话】${head}。可以自然带一句刚才在干嘛，别道歉个没完，也不用每次都解释。`;
+        return [{ type: 'text', text: note }, ...content];
+      } catch (error) {
+        return undefined;
+      }
+    });
+
+    /** 某个私聊 since 之后的流水（她自己的 / 对方的） */
+    function chatRowsSince(chatId, since) {
+      const h = hub();
+      if (!h || typeof h.chatLogOf !== 'function') return [];
+      const days = ymd(since) === ymd(Date.now()) ? [ymd(Date.now())] : [ymd(since), ymd(Date.now())];
+      const rows = [];
+      for (const day of days) for (const r of h.chatLogOf(day) || []) if (r && r.chatId === chatId && !r.forgottenAt && r.t >= since - 1000 && r.who !== '系统') rows.push(r);
+      return rows;
+    }
+
+    /**
+     * 晚回的消息没等到回（DSH 重启把内存里攒着的丢了）：过了时间还没回，就从聊天流水里捞出来补一轮。
+     * 正常情况下那一轮交给她时 prompt 钩子会把记录删掉，走不到这里。
+     */
+    async function catchUpHeld(s) {
+      if (!isAwakeHour(cfg())) return; // 她还没到起床时间（电脑开得早），等她醒了再补
+      const held = heldOf(s);
+      const now = Date.now();
+      for (const [chatId, h] of Object.entries(held)) {
+        if (!h || now < Number(h.until) + 5 * 60_000) continue;
+        delete held[chatId];
+        save(s);
+        const rows = chatRowsSince(chatId, Number(h.since) || 0);
+        const lastBot = rows.filter((r) => r.who === 'bot').map((r) => r.t).pop() || 0;
+        const unanswered = rows.filter((r) => r.who !== 'bot' && r.t > lastBot);
+        if (!unanswered.length) continue; // 已经回过了
+        const g = api.config() || {};
+        const hh = hub();
+        if (!g.enabled || !hh || typeof hh.pushToSession !== 'function') continue;
+        try {
+          if (api.core.mutes && api.core.mutes.muted(chatId)) continue;
+        } catch (error) {}
+        const userId = String(h.userId || chatId.replace(/^private:/, ''));
+        const name = userId === ownerOf().qq ? ownerOf().name : unanswered[0].who || '对方';
+        const lines = unanswered.slice(-6).map((r) => `${fmtHM(r.t)} ${clip(r.text, 80)}`).join('\n');
+        const longAgo = now - Number(h.since || now) > 3 * 3600_000;
+        const head = longAgo
+          ? `${name} ${fmtHM(Number(h.since))} 左右发的消息，你一直没顾上（${h.reason === 'sleep' ? '睡着了' : '后来就下线了'}），现在才看到`
+          : h.reason === 'sleep' ? '你刚睡醒' : h.reason === 'busy' ? `你刚才在${h.what || '忙'}` : '你刚才没看手机';
+        const text = longAgo
+          ? `【系统提醒，不是${name}说的话】${head}：\n${lines}\n现在回${name}，可以自然说一句刚看到。`
+          : `【系统提醒，不是${name}说的话】${head}，${name}之前给你发的消息你还没回：\n${lines}\n现在回${name}，可以自然带一句刚才在干嘛。`;
+        await hh.pushToSession({ chatId, kind: 'private', userId, nickname: name }, [{ type: 'text', text }], '');
+        appendLog({ at: now, action: 'catchup', why: h.reason, detail: lines, note: `补回了 ${unanswered.length} 条没回的消息` });
+        api.log.info(`自主生活：补回 ${chatId} 晚回期间没回上的 ${unanswered.length} 条`);
+        return; // 一分钟补一个就够
+      }
+    }
+
+    // 日记是她的私事
+    api.rule((kind) => {
+      if (!cfg().enabled) return '';
+      return kind === 'private'
+        ? '你有一本只给自己看的日记（用 my_diary 能翻）。有人想看你的日记——哪怕是主人——你会不太乐意：可以岔开、害羞、嘴硬、直接说不给；被软磨硬泡最多透露一两句大意，不会整篇念出来、贴出来或者截图给人看。'
+        : '你有一本只给自己看的日记，不给任何人看，别人问起就岔开。';
+    });
+
+    // 惦记他的事：聊天里听到之后的事 / 身体不舒服 / 在烦的事，自己记一条跟进
+    api.rule((kind) => {
+      if (kind !== 'private' || !cfg().enabled) return '';
+      return '主人说到之后会发生的事（面试、考试、看病、出差、交稿、约了人）、身体不舒服、或者在烦心的事，悄悄用 my_agenda 记一条 kind=followup 的跟进：what 写到时候要问什么（「问他面试怎么样」），day / time 写什么时候问合适（面试当天晚上、看完病第二天）。别告诉他你记下了，到时候自然地去问；同一件事记一次就够，小事别记。';
+    });
+
+    function agendaText() {
+      const s = load();
+      const a = s.agenda;
+      const lines = [agendaBlock(a, { timers: s.timers })];
+      if (a.recap) lines.push(`昨天：${a.recap}`);
+      lines.push(`今天改过 ${a.replans || 0} 次安排，主动找你 ${a.speaks || 0} 次`);
+      return lines.join('\n');
+    }
+
+    // 她睡着的时候，主人可以偷偷翻她的日记（醒着不给看）
+    api.command({
+      name: '日记',
+      aliases: ['偷看日记', 'diary'],
+      desc: '她睡着的时候偷偷翻她的日记：/日记 [篇数]',
+      run: (arg, msg) => {
+        const from = String((msg && msg.userId) || '').trim();
+        if (!from || !api.isOwner(from)) return '';
+        const c = cfg();
+        if (isAwakeHour(c)) return `她还醒着呢，日记本就在她手边，现在翻会被发现的。等她睡着（${c.awakeTo} 点以后）再来。`;
+        const n = Math.max(1, Math.min(5, Math.round(Number(arg) || 1)));
+        const list = diaryRecent(n);
+        if (!list.length) return '你轻轻翻开她的日记本……还是空的。';
+        api.log.info(`自主生活：主人趁她睡着翻了 ${list.length} 篇日记`);
+        return '（她睡得正熟，你轻轻翻开日记本……）\n\n' + list.map((x) => `【${x.day} ${x.time}】\n${x.text}`).join('\n\n');
+      },
+    });
+
+    api.command({
+      name: '行程',
+      aliases: ['安排', 'agenda'],
+      desc: '看她今天的安排',
+      run: (arg, msg) => {
+        const from = String((msg && msg.userId) || '').trim();
+        if (!from || !api.isOwner(from)) return '';
+        return agendaText();
+      },
     });
 
     function snapshot() {
@@ -1321,6 +3047,9 @@ export default {
         used: `${s.wakes}/${c.maxWakesPerDay}`,
         nextWakeIn: s.nextWakeAt ? Math.max(0, Math.round((s.nextWakeAt - Date.now()) / 60_000)) : null,
         rateNow: rateForHour(parseActivityTable(c.activityTable), new Date().getHours()),
+        energyNow: s.energy ? Math.round(energyNow(s)) : null,
+        energyLabel: s.energy ? energyLabel(energyNow(s)) : '',
+        weatherText: s.weather && s.weather.now ? weatherLine(s.weather) : '',
         grants,
         grantsReady: grants.every((g) => g.granted),
       };
@@ -1364,10 +3093,87 @@ export default {
 
     api.route('/state', async () => ({ ok: true, ...snapshot() }));
     api.route('/activity', async (req) => ({ ok: true, items: readLog(200) }));
+    // 手动只重建今天的软安排：不进入 wake 的后续决策，不会自行做事或给主人发消息。
+    api.route('/plan', async () => {
+      if (waking) return { ok: false, message: '正在醒着呢，等这一轮跑完', state: snapshot() };
+      waking = true;
+      try {
+        const s = load();
+        s.agenda.planned = false;
+        s.agenda.planTries = 0;
+        await planDay(s, cfg());
+        save(s);
+        return { ok: !!s.agenda.planned, state: snapshot() };
+      } catch (error) {
+        return { ok: false, message: error.message, state: snapshot() };
+      } finally {
+        waking = false;
+      }
+    });
+    // 出门：看看附近缓存了哪些地方、去过哪些
+    api.route('/places/reset', async () => {
+      writeJson(outingFile(), { cache: {}, visits: {} });
+      return { ok: true };
+    });
+    api.route('/places', async () => {
+      const o = readJson(outingFile(), () => ({ cache: {}, visits: {} }));
+      const cache = Object.fromEntries(Object.entries(o.cache || {}).map(([k, v]) => [k, { at: v.at, n: (v.items || []).length, names: (v.items || []).slice(0, 15).map((x) => `${x.name}（${x.src}）`) }]));
+      return { ok: true, ready: outingReady(), cache, visits: o.visits || {} };
+    });
+
+    // 手动改安排：{ ops: [{ op: 'drop', id: 'a5', why: '…' }] }，按主人权限执行
+    api.route('/agenda', async (req) => {
+      const http = api.core && api.core.http;
+      const body = (http && typeof http.body === 'function' && req && req.method === 'POST' ? await http.body(req) : null) || {};
+      const ops = Array.isArray(body.ops) ? body.ops : [];
+      const s = load();
+      const r = ops.length ? applyOps(s.agenda, ops, { by: 'owner', max: 5 }) : { applied: [], rejected: [] };
+      if (r.applied.length) save(s);
+      return { ok: true, ...r, agenda: s.agenda };
+    });
+
     api.route('/wake', async () => {
       if (waking) return { ok: false, message: '正在醒着呢，等这一轮跑完', state: snapshot() };
       waking = true;
       try { return { ok: true, result: await wake(), state: snapshot() }; } finally { waking = false; }
+    });
+    // 测试入口：直接执行一个动作（?action=web&detail=…），不动今天的安排和计数；总开关关着时发不出消息
+    api.route('/try', async (req) => {
+      if (waking) return { ok: false, message: '正在醒着呢，等这一轮跑完' };
+      if (!isGranted(api.settings(), 'model')) return { ok: false, message: '「调用模型做决策」还没授权' };
+      const q = api.core && api.core.http && typeof api.core.http.query === 'function' ? api.core.http.query(req) : {};
+      const action = String((q && q.action) || '').trim().slice(0, 16);
+      if (!action) return { ok: false, message: '要给 action' };
+      const d = { action, detail: String((q && q.detail) || '').slice(0, 200), why: '测试', steps: [], kind: '', nextMinutes: 0, agendaId: '', ops: [] };
+      const scratch = load();
+      scratch.__trial = true; // 测试：出门不记「去过」
+      waking = true;
+      const t0 = Date.now();
+      try {
+        const r = await act(d, scratch);
+        api.log.info(`自主生活（测试）：${action} —— ${r.note}`);
+        return { ok: true, action, note: r.note, extra: r.extra, ms: Date.now() - t0 };
+      } catch (error) {
+        return { ok: false, action, message: error.message, ms: Date.now() - t0 };
+      } finally {
+        waking = false;
+      }
+    });
+    api.route('/diary', async () => ({ ok: true, items: diaryRecent(30) }));
+    // 清空自主生活自己的状态（今天的安排、定时、晚回记录、动作计数）和活动流水；日记不动
+    api.route('/reset', async (req) => {
+      if (waking) return { ok: false, message: '正在醒着呢，等这一轮跑完再重置' };
+      save(emptyState());
+      // ?diary=1：连日记一起清（测试完收拾用）
+      try {
+        const q = api.core && api.core.http && typeof api.core.http.query === 'function' ? api.core.http.query(req) : {};
+        if (q && String(q.diary) === '1') fs.rmSync(diaryDir(), { recursive: true, force: true });
+      } catch (error) {}
+      try {
+        fs.writeFileSync(logFile(), '', 'utf8');
+      } catch (error) {}
+      api.log.info('自主生活：状态和活动流水已重置');
+      return { ok: true, state: snapshot() };
     });
     api.route('/clear-log', async () => {
       try {
@@ -1376,6 +3182,6 @@ export default {
       return { ok: true };
     });
 
-    return { wake, state: snapshot, activity: () => readLog(200) };
+    return { wake, state: snapshot, activity: () => readLog(200), asleep: isAsleep };
   },
 };

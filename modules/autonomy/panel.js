@@ -31,7 +31,13 @@ const ACTION_LABEL = {
   diary: '写日记',
   draw: '画画',
   free: '自由发挥',
+  plan: '定安排',
+  bedtime: '睡前',
+  catchup: '补回消息',
+  timer: '定时提醒',
 }
+
+const SLOT_LABEL = { morning: '上午', afternoon: '下午', evening: '晚上', night: '深夜' }
 
 const ACTION_COLOR = {
   idle: '#8a8a8a',
@@ -41,6 +47,8 @@ const ACTION_COLOR = {
   diary: '#2e9e44',
   draw: '#7b2fc0',
   free: '#1bb8c4',
+  plan: '#c08a2e',
+  timer: '#e0a060',
 }
 
 function fmtTime(ts) {
@@ -52,6 +60,8 @@ function fmtTime(ts) {
 return function Panel({ settings, save, toast }) {
   const [state, setState] = useState(null)
   const [log, setLog] = useState([])
+  const [diary, setDiary] = useState([])
+  const [diaryOpen, setDiaryOpen] = useState(false)
   const [busy, setBusy] = useState(false)
 
   const refresh = useCallback(async () => {
@@ -60,6 +70,8 @@ return function Panel({ settings, save, toast }) {
       if (s && s.ok) setState(s)
       const a = await api('/activity')
       if (a && a.ok) setLog(a.items || [])
+      const dy = await api('/diary')
+      if (dy && dy.ok) setDiary(dy.items || [])
     } catch (e) {
       /* 接口还没起来 */
     }
@@ -204,9 +216,10 @@ return function Panel({ settings, save, toast }) {
             statRow('今天醒了', `${state.used} 次`),
             statRow('下次醒来', state.nextWakeIn === null ? '还没排' : `${state.nextWakeIn} 分钟后`),
             statRow('当前时段倍率', `${state.rateNow}${state.rateNow < 1 ? '（活跃）' : state.rateNow > 1 ? '（安静）' : ''}`),
-            statRow('今天计划', state.plan && state.plan.length ? state.plan.join('、') : '还没定'),
             statRow('性格（人格卡）', (state.mbti || '-') + ' · 调皮度 ' + ((state.config && state.config.playfulness) || 'medium')),
             statRow('心情', state.mood || '-'),
+            statRow('精力', state.energyNow === null || state.energyNow === undefined ? '还没起床' : `${state.energyLabel}（${state.energyNow}/100）`),
+            state.weatherText ? statRow('天气', state.weatherText) : null,
             state.note ? statRow('她留给自己的话', state.note) : null,
           )
         : h(ui.Empty, null, '读取中…'),
@@ -214,6 +227,50 @@ return function Panel({ settings, save, toast }) {
         h(ui.Btn, { onClick: wakeNow, disabled: busy }, busy ? '叫她起来…' : '现在叫醒她一次'),
         h(ui.Btn, { onClick: refresh }, '刷新'),
       ),
+    ),
+
+    h(ui.Card, { title: '今天的安排' },
+      state && state.agenda
+        ? h('div', null,
+            state.agenda.theme ? h('div', { className: 'ab-note', style: { marginBottom: 6 } }, state.agenda.theme) : null,
+            (state.agenda.items || []).length
+              ? (state.agenda.items || []).map((x) =>
+                  h('div', {
+                    key: x.id,
+                    style: { display: 'flex', gap: 8, padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,.06)', alignItems: 'baseline', opacity: x.state === 'dropped' ? 0.45 : 1 },
+                  },
+                    h('span', { className: 'ab-muted ab-small', style: { minWidth: 30 } }, x.id),
+                    h('span', { className: 'ab-small', style: { minWidth: 36 } }, SLOT_LABEL[x.slot] || x.slot),
+                    h('span', { style: { flex: 1, textDecoration: x.state === 'dropped' ? 'line-through' : 'none' } },
+                      x.what,
+                      x.from === 'promise' ? h('span', { className: 'ab-small', style: { color: '#e0a060', marginLeft: 6 } }, '约定') : null,
+                      x.from === 'seen' ? h('span', { className: 'ab-small', style: { color: '#6fa8dc', marginLeft: 6 } }, '临时加的') : null,
+                    ),
+                    h('span', { className: 'ab-small ab-muted', style: { maxWidth: '45%', textAlign: 'right' } },
+                      (x.state === 'done' ? '✓ ' : x.state === 'dropped' ? '划掉 ' : '') + (x.note || ''),
+                    ),
+                  ))
+              : h(ui.Empty, null, state.agenda.planned ? '今天没排什么，随心过' : '还没定（今天第一次醒来时定）'),
+            (state.timers || []).filter((t) => !t.fired).map((t) =>
+              h('div', { key: t.id, className: 'ab-small', style: { padding: '4px 0', color: '#e0a060' } }, `⏰ ${fmtTime(t.at)} ${t.what}`),
+            ),
+            state.agenda.recap ? h('div', { className: 'ab-note ab-small', style: { marginTop: 8 } }, '昨天：' + state.agenda.recap) : null,
+            h('div', { className: 'ab-muted ab-small', style: { marginTop: 6 } }, `改过 ${state.agenda.replans || 0} 次 · 主动找主人 ${state.agenda.speaks || 0} 次`),
+          )
+        : h(ui.Empty, null, '读取中…'),
+    ),
+
+    h(ui.Card, { title: '她的日记（只写在本地，不发空间）' },
+      diary.length
+        ? h('div', null,
+            (diaryOpen ? diary : diary.slice(0, 2)).map((x, i) =>
+              h('div', { key: i, style: { padding: '6px 0', borderBottom: '1px solid rgba(255,255,255,.06)' } },
+                h('div', { className: 'ab-muted ab-small' }, `${x.day} ${x.time}`),
+                h('div', { className: 'ab-small', style: { whiteSpace: 'pre-wrap', marginTop: 2 } }, x.text),
+              )),
+            diary.length > 2 ? h('div', { style: { marginTop: 8 } }, h(ui.Btn, { onClick: () => setDiaryOpen(!diaryOpen) }, diaryOpen ? '收起' : `看全部 ${diary.length} 篇`)) : null,
+          )
+        : h(ui.Empty, null, '还没写过日记'),
     ),
 
     h(ui.Card, { title: '今天做了什么' },
