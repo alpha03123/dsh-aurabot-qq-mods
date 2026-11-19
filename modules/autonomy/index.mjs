@@ -548,6 +548,12 @@ export default {
       hint: '她在忙或出门时来了私聊，由她自己判断现在回还是过一会儿再看；不在活跃时段（睡着了）时等醒了再回。期间的消息会攒在一起，正聊着时照常回。需要插件版本带 reply/hold 事件。',
     },
     {
+      key: 'bedtimeRollover',
+      label: '睡后自动整理会话',
+      type: 'switch',
+      hint: '睡着后且停聊满 30 分钟时，自动整理归档当天会话并留中文备忘给次日衔接（关机错过则次日开机补做），避开 DSH 80% 英文代码压缩。默认开。',
+    },
+    {
       key: 'allowNewMod',
       label: '允许她给自己写新模块',
       type: 'switch',
@@ -630,8 +636,18 @@ export default {
             if (out.length >= limit) break;
             const m = h && h.it;
             if (!m || !m.text || have.has(m.id)) continue;
-            if (m.kind === 'seen' && seenN >= 2) continue;
+            if (m.kind === 'seen' && seenN >= 1) continue;
             if (m.kind === 'seen') seenN++;
+            have.add(m.id);
+            out.push(hintLine(m));
+          }
+        }
+        // 分层记忆补充：若记忆库开启了 L1 热记忆，优先确保最活跃的几条非 seen 记忆也能进小脑视野
+        if (out.length < limit && typeof mem.list === 'function') {
+          for (const m of mem.list('') || []) {
+            if (out.length >= limit) break;
+            if (!m || !m.text || m.invalidAt || m.kind === 'seen' || have.has(m.id)) continue;
+            if ((Number(m.clicks) || 0) <= 0 && (Number(m.importance) || 0) < 0.7 && m.kind !== 'self') continue;
             have.add(m.id);
             out.push(hintLine(m));
           }
@@ -2485,6 +2501,12 @@ export default {
           return;
         }
       }
+      // 方案 B：睡后或次日开机补做会话整理归档（避开 DSH 80% 英文代码压缩）
+      try {
+        await maybeRolloverSessions(s, c);
+      } catch (error) {
+        api.log.warn('自主生活：睡后整理会话出错 ' + error.message);
+      }
       // 和主人约好几点的事：到点直接在私聊里叫她开口（不经过决策，不受活跃时段、次数限制）
       if (!s.lastSeenAt || Date.now() - Number(s.lastSeenAt) > 5 * 60_000) {
         s.lastSeenAt = Date.now();
@@ -2714,8 +2736,9 @@ export default {
       ];
     });
 
-    // 聊天时把当前背景（时间、天气、在做什么）归拢成一行；不塞「接下来想干嘛」以免打断聊天
-    if (typeof api.context === 'function') api.context(({ chat } = {}) => {
+    // 方案 A：动态当前背景（时间、天气、刚才在干嘛、精力、出门）不再写入 api.context（会每分钟触发 DSH 重贴 1500 字快照），
+    // 改为在 api.on('prompt') 里只贴在当轮消息前，让历史里的状态天然附着在对应时间点。
+    function buildTurnBackground(chat) {
       try {
         if (!cfg().enabled || !chat) return '';
         const nowStr = `${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}`;
@@ -2742,7 +2765,97 @@ export default {
       } catch (error) {
         return '';
       }
-    });
+    }
+
+    /**
+     * 方案 B：睡后 / 关机次日开机补做会话整理归档。
+     * 1. 电脑开着：过了活跃时段（!isAwakeHour）且停聊 ≥ 30 分钟，整理归档当天会话；
+     * 2. 昨晚提前关机没跑到：次日开机发现活跃会话建于今天之前且已停聊，先补做归档与中文交接再开启今天新会话；
+     * 3. 群聊会话：不天天强制切，仅在建于更早日期、停聊 ≥ 30 分钟且近 3 天累计 ≥ 40 条或已超过 3 天时整理。
+     */
+    let rollingOver = false;
+    async function maybeRolloverSessions(s, c) {
+      if (rollingOver || !c.enabled || c.bedtimeRollover === false) return false;
+      const mem = api.use('memory');
+      const h = hub();
+      if (!mem || typeof mem.sessionRollover !== 'function' || !h || typeof h.sessions !== 'function') return false;
+      const sessions = h.sessions() || {};
+      const now = Date.now();
+      const today = ymd(now); // 和 sess.createdAt / 聊天流水同一种 YYYY-MM-DD 口径，才能比较先后
+      const IDLE_MS = 30 * 60_000;
+      const lastActivityFor = (chatId) => {
+        let t = lastOut.get(chatId) || 0;
+        if (chatId.startsWith('private:')) {
+          const qq = chatId.slice(8);
+          if (typeof h.lastPrivateAt === 'function') t = Math.max(t, Number(h.lastPrivateAt(qq)) || 0);
+          if (qq === ownerOf().qq && h.lastBotToOwner) t = Math.max(t, Number(h.lastBotToOwner.at) || 0);
+        }
+        if (typeof h.chatLogDays === 'function' && typeof h.chatLogOf === 'function') {
+          for (const d of (h.chatLogDays() || []).slice(-3)) {
+            for (const row of h.chatLogOf(d) || []) {
+              if (row && row.chatId === chatId && Number(row.t) > t) t = Number(row.t);
+            }
+          }
+        }
+        return t;
+      };
+      const recentCountFor = (chatId) => {
+        if (typeof h.chatLogDays !== 'function' || typeof h.chatLogOf !== 'function') return 0;
+        let n = 0;
+        for (const d of (h.chatLogDays() || []).slice(-3)) {
+          for (const row of h.chatLogOf(d) || []) if (row && row.chatId === chatId && row.kind !== 'seen' && !row.forgottenAt) n++;
+        }
+        return n;
+      };
+      const { qq } = ownerOf();
+      const ownerChatId = qq ? `private:${qq}` : '';
+      const asleep = !isAwakeHour(c);
+      rollingOver = true;
+      try {
+        // 1) 主人私聊：睡后整理 或 关机错过后的开机补做
+        if (ownerChatId && sessions[ownerChatId]) {
+          const sess = sessions[ownerChatId];
+          const sessDay = ymd(Number(sess.createdAt) || now);
+          const lastAt = lastActivityFor(ownerChatId);
+          const lastDay = lastAt ? ymd(lastAt) : sessDay;
+          const idleOk = !lastAt || now - lastAt >= IDLE_MS;
+          const dueBedtime = asleep && s.sessionRolloverDay !== today && idleOk;
+          const dueCatchUp = sessDay < today && s.sessionRolloverDay !== sessDay && (lastDay < today || idleOk);
+          if (dueBedtime || dueCatchUp) {
+            const targetDay = dueBedtime ? today : sessDay;
+            const r = await mem.sessionRollover(ownerChatId, { day: targetDay, merge: true });
+            if (r && r.ok) {
+              s.sessionRolloverDay = targetDay;
+              save(s);
+              api.log.info(`自主生活：${dueBedtime ? '睡后' : '开机补做'}整理了主人私聊会话（${targetDay}）`);
+              return true;
+            }
+          }
+        }
+        // 2) 群聊会话：睡后或跨日且足够活跃/陈旧时温和整理
+        const groupRollovers = (s.groupRolloverDays && typeof s.groupRolloverDays === 'object') ? s.groupRolloverDays : (s.groupRolloverDays = {});
+        for (const [chatId, sess] of Object.entries(sessions)) {
+          if (!chatId.startsWith('group:') || !sess) continue;
+          const sessDay = ymd(Number(sess.createdAt) || now);
+          if (sessDay >= today || groupRollovers[chatId] === today) continue;
+          const lastAt = lastActivityFor(chatId);
+          if (lastAt && now - lastAt < IDLE_MS) continue;
+          const ageDays = (now - (Number(sess.createdAt) || now)) / 86400_000;
+          const lines = recentCountFor(chatId);
+          if (lines < 40 && ageDays < 3) continue;
+          const r = await mem.sessionRollover(chatId, { day: today, merge: false });
+          if (r && r.ok) {
+            groupRollovers[chatId] = today;
+            save(s);
+            api.log.info(`自主生活：温和整理了群会话 ${chatId}（${lines} 条近流水）`);
+            return true;
+          }
+        }
+      } finally {
+        rollingOver = false;
+      }
+      return false;
+    }
 
     // ── 忙的时候晚点回（reply/hold，需要插件核心带这个事件）────────────────
     // 判断时机：只在「开启一段新对话」时可能晚回；正聊着（10 分钟内有来回）、急事一律照常。
@@ -3049,7 +3162,7 @@ export default {
             const t = Date.now();
             if (t + r.minutes * 60_000 < h2.until) {
               h2.until = t + r.minutes * 60_000;
-              h2.woken = true;
+              if (r.minutes === 0) h2.woken = true;
             }
             save(s2);
             return Math.max(0, h2.until - t);
@@ -3180,23 +3293,27 @@ export default {
       return true;
     }
 
-    // 晚回的那一轮真交给她时：前面补一句刚才在干嘛
+    // 方案 A + 晚回提示：每轮把动态背景（时间/天气/刚才在干嘛）与晚回说明一起贴在当轮消息前，不再污染系统快照
     api.on('prompt', (content, info = {}) => {
       try {
         const chat = info.chat || {};
-        if (chat.kind === 'group' && Array.isArray(content) && groupWoken.has(chat.chatId)) {
+        if (!Array.isArray(content) || chat.kind === 'system') return undefined;
+        const prefix = [];
+        const bg = buildTurnBackground(chat);
+        if (bg) prefix.push({ type: 'text', text: bg });
+        if (chat.kind === 'group' && groupWoken.has(chat.chatId)) {
           const at = groupWoken.get(chat.chatId);
           groupWoken.delete(chat.chatId);
-          if (Date.now() - at < 10 * 60_000) return [{ type: 'text', text: '【系统提示，不是群里谁说的话】你本来睡着了，被群里的消息吵醒，迷迷糊糊的、有点起床气。回得短一点，可以带一句被吵醒了。' }, ...content];
-          return undefined;
+          if (Date.now() - at < 10 * 60_000) prefix.push({ type: 'text', text: '【系统提示，不是群里谁说的话】你本来睡着了，被群里的消息吵醒，迷迷糊糊的、有点起床气。回得短一点，可以带一句被吵醒了。' });
+          return prefix.length ? [...prefix, ...content] : undefined;
         }
-        if (chat.kind !== 'private' || !Array.isArray(content)) return undefined;
+        if (chat.kind !== 'private') return prefix.length ? [...prefix, ...content] : undefined;
         const first = content.find((x) => x && x.type === 'text');
-        if (first && /^【系统提醒/.test(String(first.text || ''))) return undefined; // 她自己主动开口的那种，不是晚回
+        if (first && /^【系统提醒/.test(String(first.text || ''))) return prefix.length ? [...prefix, ...content] : undefined; // 她自己主动开口的那种，不是晚回
         const s = load();
         const held = heldOf(s);
         const h = held[chat.chatId];
-        if (!h || Date.now() < h.until - 5_000) return undefined;
+        if (!h || Date.now() < h.until - 5_000) return prefix.length ? [...prefix, ...content] : undefined;
         delete held[chat.chatId];
         save(s);
         const mins = Math.max(1, Math.round((Date.now() - h.since) / 60_000));
@@ -3212,7 +3329,8 @@ export default {
                 ? `刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
                 : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
         const note = `【刚才背景（不必刻意报备，直接正常聊就行）】${head}。`;
-        return [{ type: 'text', text: note }, ...content];
+        prefix.push({ type: 'text', text: note });
+        return [...prefix, ...content];
       } catch (error) {
         return undefined;
       }
