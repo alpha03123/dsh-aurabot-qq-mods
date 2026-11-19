@@ -56,6 +56,7 @@ import {
   statusLine,
 } from './lib/agenda.mjs';
 import { PLACE_KINDS, pickKind, searchAmap, searchOsm, choosePlace, fmtDistance } from './lib/outing.mjs';
+import { htmlArticle } from './lib/webtext.mjs';
 
 import crypto from 'node:crypto';
 
@@ -530,6 +531,7 @@ export default {
     weatherLon: 121.544,
     // 本地改：出门（真实地点）。家的位置用 WGS84 经纬度；高德 key 没填就只用 OSM
     outingEnabled: false,
+    webSearch: 'dsh',
     homeName: '',
     homeLat: '',
     homeLon: '',
@@ -541,6 +543,7 @@ export default {
     { key: 'weatherCity', label: '她住的城市（查天气用）', type: 'text', hint: '写中文城市名，比如 宁波。改了城市就把下面两个经纬度清空，会自动重新查。留空 = 不看天气' },
     { key: 'weatherLat', label: '纬度（可留空自动查）', type: 'number' },
     { key: 'weatherLon', label: '经度（可留空自动查）', type: 'number' },
+    { key: 'webSearch', label: '上网查东西用什么', type: 'select', options: [{ value: 'dsh', label: 'DSH 联网搜索（DeepSeek 官方搜索 + 直接读网页，不开浏览器）' }, { value: 'browser', label: 'Bing + 专用浏览器（要开 browser-ops）' }], hint: 'DSH 联网搜索用的是 DSH 里存的 DeepSeek key，每搜一次多花一次模型调用；要 JS 才显示正文的网页读不到。' },
     { key: 'outingEnabled', label: '允许她出门（去附近真实的店 / 公园）', type: 'switch', hint: '要先填下面「住的地方」的经纬度。地点来自高德（填了 key 时）或 OpenStreetMap；店里的经历由模型按真实店名、距离、天气来写。' },
     { key: 'homeName', label: '住的地方（给她看的名字，比如「月湖边上」）', type: 'text', hint: '别填真实住址，选一片街区 / 商圈就好——她会在聊天里提到去过的地方' },
     { key: 'homeLat', label: '住处纬度（WGS84）', type: 'number' },
@@ -1551,31 +1554,134 @@ export default {
       }
     }
 
+    /** 上网走哪条路：dsh = DSH 的联网搜索服务（ctx.web，现在是 DeepSeek 官方联网搜索）+ HTTP 抓正文；browser = Bing + 专用浏览器 */
+    const webMode = () => (String(cfg().webSearch || 'dsh') === 'browser' ? 'browser' : 'dsh');
+    const dshWeb = () => {
+      try {
+        const w = api.dsh && typeof api.dsh.get === 'function' ? api.dsh.get('web') : null;
+        return w && typeof w.search === 'function' ? w : null;
+      } catch (error) {
+        return null;
+      }
+    };
+
     async function browseWeb(d, s) {
-      const bo = api.use('browser-ops');
-      if (!bo || typeof bo.runTask !== 'function') return { note: '想上网逛逛，但浏览器模块没开着', extra: { ok: false } };
       // want 是她想弄明白的事（给读页面用），topic 是真正拿去搜的关键词
       const want = clip(d.detail || d.why, 80) || '最近有什么好玩的';
       const topic = clip(d.query, 40) || clip(d.detail || d.why, 40) || '最近有什么好玩的';
-      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(topic)}`;
-      const r1 = await bo.runTask({ goal: topic, url: searchUrl });
-      if (!r1 || !r1.ok) return { note: `想上网查「${topic}」，没打开：${clip((r1 && (r1.message || r1.error)) || '未知', 60)}`, extra: { ok: false } };
       const timeoutMs = Math.max(20, Number(cfg().askTimeoutSec) || 45) * 1000;
-      let page = String(r1.text || '');
-      let link = searchUrl;
-      let title = '';
-      let images = [];
-      // 从结果里挑一条点开（模型不挑或打不开，就只看搜索结果页）
+      const r = webMode() === 'browser' ? await searchByBrowser(want, topic, s, timeoutMs) : await searchByDsh(want, topic, s, timeoutMs);
+      if (r.fail) return r.fail;
+      return finishWeb({ want, topic, s, timeoutMs, ...r });
+    }
+
+    /** 让她从搜索结果里挑想点开的（按想看的顺序，最多 n 条） */
+    async function pickResults(want, listText, s, timeoutMs, n) {
       try {
         const out = await ask(api.dsh, { key: 'web-pick', cfg: api.config(),
           system: '你在网上查东西，只输出 JSON。',
-          text: `你想查：${want}\n下面是搜索结果页（→ 后面是链接）：\n${clip(page, 2500)}\n${webBlockedText(s) ? `\n这些网站最近打不开：${webBlockedText(s)}\n` : ''}\n挑一个你最想点开的结果，回 {"url":"完整链接"}；都没意思就回 {"url":""}。`,
-          maxTokens: 200,
+          text: `你想查：${want}\n下面是搜索结果（→ 后面是链接）：\n${clip(listText, 2500)}\n${webBlockedText(s) ? `\n这些网站最近打不开：${webBlockedText(s)}\n` : ''}\n挑你最想点开的结果，按想看的顺序最多 ${n} 条，回 {"urls":["完整链接"]}；都没意思就回 {"urls":[]}。`,
+          maxTokens: 300,
           temperature: 0.7,
           timeoutMs,
         });
-        const u = String((parseJsonLoose(out) || {}).url || '').trim();
-        if (/^https?:\/\//i.test(u) && u !== searchUrl) {
+        const j = parseJsonLoose(out) || {};
+        const urls = Array.isArray(j.urls) ? j.urls : j.url ? [j.url] : [];
+        return urls.map((u) => String(u || '').trim()).filter((u) => /^https?:\/\//i.test(u)).slice(0, n);
+      } catch (error) {
+        api.log.warn('自主生活：上网挑结果失败 ' + error.message);
+        return [];
+      }
+    }
+
+    /**
+     * 用 DSH 的 HTTP 抓取读一页。DSH 不跟跨域重定向（http→https、子域名跳主站都算），
+     * 遇到就自己一跳一跳问出最终地址（每跳都查是不是公网），再交给 DSH 读。
+     */
+    async function fetchPage(web, url) {
+      const net = (() => { try { return api.lib('core/net.js'); } catch (error) { return null; } })();
+      const guard = async (u) => { if (net && typeof net.assertPublicUrl === 'function') await net.assertPublicUrl(u); };
+      let u = String(url).replace(/^http:\/\//i, 'https://');
+      await guard(u);
+      try {
+        return await web.fetch({ url: u });
+      } catch (error) {
+        if (!/cross-origin redirect|REDIRECT/i.test(`${error.code || ''} ${error.message}`)) throw error;
+      }
+      for (let hop = 0; hop < 5; hop++) {
+        const r = await fetch(u, { redirect: 'manual', signal: AbortSignal.timeout(15000), headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', 'accept-language': 'zh-CN,zh;q=0.9' } });
+        try { await r.body?.cancel(); } catch (error) {}
+        const loc = [301, 302, 303, 307, 308].includes(r.status) ? r.headers.get('location') : null;
+        if (!loc) break;
+        u = new URL(loc, u).href;
+        await guard(u);
+      }
+      return await web.fetch({ url: u });
+    }
+
+    /** DSH 联网搜索：拿到标题和链接，点开时用 DSH 的 HTTP 抓取读正文（不开浏览器） */
+    async function searchByDsh(want, topic, s, timeoutMs) {
+      const web = dshWeb();
+      if (!web) return { fail: { note: '想上网查东西，但 DSH 的联网搜索服务不在', extra: { ok: false } } };
+      let sources = [];
+      try {
+        const res = await web.search({ query: topic, maxResults: 8 });
+        sources = (res && Array.isArray(res.sources) ? res.sources : []).filter((x) => x && x.url);
+      } catch (error) {
+        return { fail: { note: `想上网查「${topic}」，搜索没成：${clip(error.message, 60)}`, extra: { ok: false } } };
+      }
+      if (!sources.length) return { fail: { note: `上网查「${topic}」：什么也没搜到`, extra: { ok: false, later: true } } };
+      const listText = sources.map((x, i) => `[${i + 1}] ${clip(x.title || '', 60)} → ${x.url}${x.snippet ? `\n    ${clip(x.snippet, 120)}` : ''}`).join('\n');
+      let page = listText;
+      let link = '';
+      let title = '';
+      let images = [];
+      let tried = '';
+      const failed = [];
+      const failedHosts = [];
+      for (const u of await pickResults(want, listText, s, timeoutMs, 3)) {
+        tried = tried || u;
+        try {
+          const f = await fetchPage(web, u);
+          if (!f || !f.body) { failed.push(`${hostOf(u)}（没内容）`); continue; }
+          if (Number(f.statusCode) >= 400) { failed.push(`${hostOf(u)}（HTTP ${f.statusCode}）`); failedHosts.push(hostOf(u)); continue; }
+          const art = f.body.kind === 'html' ? htmlArticle(f.body.content, f.url || u) : { title: '', text: clip(String(f.body.content || ''), 4000), images: [] };
+          if (art.text.length < 200) {
+            // 太短：多半是验证页、登录页、要 JS 才出正文的页面 —— 原样给她看是哪种，再试下一条
+            failed.push(`${hostOf(f.url || u)}（只有几句：${clip(art.title || art.text, 40)}）`);
+            failedHosts.push(hostOf(f.url || u));
+            tried = f.url || u;
+            continue;
+          }
+          link = String(f.url || u);
+          title = art.title;
+          page = `页面：${clip(art.title, 80)}\n正文：${art.text}`;
+          images = art.images;
+          break;
+        } catch (error) {
+          failed.push(`${hostOf(u)}（${clip(error.message, 30)}）`);
+          failedHosts.push(hostOf(u));
+          api.log.debug?.(`自主生活：打开 ${hostOf(u)} 没成 ${error.message}`);
+        }
+      }
+      if (!link && failed.length) page = `${listText}\n\n你点了这几条，都没打开：${failed.join('；')}`;
+      return { page, link, title, images, opened: !!link, blockedGuess: link || tried, failedHosts: link ? [] : failedHosts.filter(Boolean) };
+    }
+
+    /** 老办法：Bing 搜索页 + 专用浏览器点开 */
+    async function searchByBrowser(want, topic, s, timeoutMs) {
+      const bo = api.use('browser-ops');
+      if (!bo || typeof bo.runTask !== 'function') return { fail: { note: '想上网逛逛，但浏览器模块没开着', extra: { ok: false } } };
+      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(topic)}`;
+      const r1 = await bo.runTask({ goal: topic, url: searchUrl });
+      if (!r1 || !r1.ok) return { fail: { note: `想上网查「${topic}」，没打开：${clip((r1 && (r1.message || r1.error)) || '未知', 60)}`, extra: { ok: false } } };
+      let page = String(r1.text || '');
+      let link = '';
+      let title = '';
+      let images = [];
+      const [u] = await pickResults(want, page, s, timeoutMs, 1);
+      if (u && u !== searchUrl) {
+        try {
           const nav = await bo.navigate(u);
           if (nav && nav.ok) {
             const article = await readArticle(bo);
@@ -1587,33 +1693,47 @@ export default {
               images = await pageImages(bo);
             }
           }
+        } catch (error) {
+          api.log.warn('自主生活：浏览器打开结果失败 ' + error.message);
         }
-      } catch (error) {
-        api.log.warn('自主生活：上网挑结果失败 ' + error.message);
       }
-      // 读完记下来：看到了什么、什么感觉、想不想之后跟主人聊
+      return { page, link: link || searchUrl, title, images, opened: !!link, blockedGuess: link || 'bing.com' };
+    }
+
+    /** 读完记下来：看到了什么、什么感觉、想不想之后跟主人聊；没查到 / 打不开如实记 */
+    async function finishWeb({ want, topic, s, timeoutMs, page, link, title, images, opened, blockedGuess, failedHosts = [] }) {
       let j = {};
       try {
         const out = await ask(api.dsh, { key: 'web-read', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
-          text: `你本来想查：${want}\n你看到的页面${link === searchUrl ? '（没点开任何一条，这是搜索结果页本身）' : `（${hostOf(link)}）`}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}（${x.w}×${x.h}）`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
-          maxTokens: 300,
+          text: `你本来想查：${want}\n你看到的${opened ? `页面（${hostOf(link)}）` : '（没点开任何一条，这是搜索结果列表本身）'}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}${x.w && x.h ? `（${x.w}×${x.h}）` : ''}`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
+          maxTokens: 600,
           temperature: 0.9,
           timeoutMs,
         });
         j = parseJsonLoose(out) || {};
+        // 输出被截断、JSON 没写完：至少把 got / saw / feeling 捞出来
+        if (!j.got && !j.saw) {
+          for (const k of ['got', 'saw', 'feeling', 'share']) {
+            const m = String(out || '').match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)'));
+            if (m) j[k] = m[1];
+          }
+        }
       } catch (error) {
         api.log.warn('自主生活：上网读页面失败 ' + error.message);
       }
+      // 读页面那一步没出结果：如实记成没读成，不当成查到了
+      if (!j.got && !j.saw) return { note: `上网查「${topic}」：页面打开了，但没读成`, extra: { ok: false, later: true, output: link } };
       const saw = clip(j.saw, 40) || clip(title, 40) || `搜了搜「${topic}」`;
       const feeling = clip(j.feeling, 40);
       const share = clip(j.share, 40);
       const got = ['found', 'missed', 'blocked'].includes(String(j.got || '').trim()) ? String(j.got).trim() : 'found';
       // 没拿到想要的：如实记成没查到 / 打不开，不算做成（later：不算动作坏了，不触发停用一天），也不记成「看过」
       if (got === 'blocked') {
-        const host = link === searchUrl ? 'bing.com' : hostOf(link);
-        if (s && host) s.webBlocked = { ...(s.webBlocked || {}), [host]: { at: Date.now(), why: saw } };
-        return { note: `上网查「${topic}」：${host || '那个网站'}打不开（${saw}），没看到内容`, extra: { ok: false, later: true, output: link } };
+        const host = /^https?:/i.test(String(blockedGuess || '')) ? hostOf(blockedGuess) : String(blockedGuess || '');
+        const hosts = [...new Set([...(failedHosts || []), host].filter(Boolean))];
+        if (s && hosts.length) s.webBlocked = { ...(s.webBlocked || {}), ...Object.fromEntries(hosts.map((x) => [x, { at: Date.now(), why: saw }])) };
+        return { note: `上网查「${topic}」：${hosts.join('、') || '那个网站'}打不开（${saw}），没看到内容`, extra: { ok: false, later: true, output: link } };
       }
       if (got === 'missed') {
         return { note: `上网查「${topic}」：没找到想要的（${saw}）${feeling ? '（' + feeling + '）' : ''}`, extra: { ok: false, later: true, output: link } };
@@ -1624,7 +1744,7 @@ export default {
           mem.addEvent({
             kind: 'seen',
             text: [saw, feeling].filter(Boolean).join('；'),
-            meta: { title: clip(title || topic, 160), url: link.slice(0, 500), platform: 'web' },
+            meta: { title: clip(title || topic, 160), url: String(link || '').slice(0, 500), platform: 'web' },
             tags: ['上网'],
             importance: 0.4,
           });
@@ -1900,6 +2020,8 @@ export default {
     /** 动作背后的模块：没开就不列、不许选 */
     const ACTION_MODULE = { bili: 'bili', web: 'browser-ops', draw: 'imagegen', phone: 'phone' };
     const moduleMissing = (action) => {
+      // 上网：默认走 DSH 的联网搜索服务，只有设成 browser 才要浏览器模块
+      if (action === 'web' && webMode() === 'dsh') return !dshWeb();
       const id = ACTION_MODULE[action];
       if (!id) return false;
       if (!api.has(id)) return true;
