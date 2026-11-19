@@ -421,6 +421,12 @@ export function parseDecision(out) {
     nextMinutes: Math.max(0, Math.min(240, Math.round(Number(j.nextMinutes) || 0))),
     // 今天安排：这次在做哪一条、顺手怎么改表（解析失败走正则兜底时没有这两样，不影响动作本身）
     agendaId: /^a\d{1,3}$/.test(String(j.agendaId || '').trim()) ? String(j.agendaId).trim() : '',
+    // 这一轮做完算不算把那条做完了：只是为它查资料、做准备的写 false（没写当作 true，兼容旧输出）
+    agendaDone: !(j.agendaDone === false || String(j.agendaDone).trim().toLowerCase() === 'false'),
+    // 这件事说的是什么（几个字的话题名），代码只拿来数「最近同一件事做了几轮」
+    topic: String(j.topic || '').replace(/[\s「」『』"“”]/g, '').slice(0, 12),
+    // web 用：拿去搜索引擎搜的关键词（不再拿 detail 那句话截断去搜）
+    query: String(j.query || '').replace(/\s+/g, ' ').trim().slice(0, 40),
     ops: Array.isArray(j.ops) ? j.ops.filter((o) => o && typeof o === 'object').slice(0, 3) : [],
     // 这件事本身：要忙多久、中途能不能放下、做完精力怎么变（她自己报，没写就是 null）
     ...selfReport(j),
@@ -707,6 +713,9 @@ export default {
       const keepFails = { streak: (s.fails && s.fails.streak) || {}, until: (s.fails && s.fails.until) || {} };
       // 定时提醒跨天有效（「明早八点叫我」），只丢掉响过的和过期一天以上的
       const keepTimers = (Array.isArray(s.timers) ? s.timers : []).filter((t) => t && !t.fired && t.at > Date.now() - 86_400_000);
+      // 最近 24 小时每轮的话题（跨天保留，done 每天清空数不到昨天）、最近 7 天打不开的网站
+      const keepTopics = (Array.isArray(s.topicLog) ? s.topicLog : []).filter((x) => x && x.topic && x.at > Date.now() - 86_400_000).slice(0, 60);
+      const keepBlocked = Object.fromEntries(Object.entries(s.webBlocked && typeof s.webBlocked === 'object' ? s.webBlocked : {}).filter(([, v]) => v && v.at > Date.now() - 7 * 86_400_000));
       if (s.day !== dayKey()) {
         // 昨天留个底，早上定计划时复盘用；答应主人还没做的直接带过来
         const prevAgenda = s.agenda && typeof s.agenda === 'object' ? s.agenda : null;
@@ -736,6 +745,8 @@ export default {
       }
       s.agenda = normalizeAgenda(s.agenda, dayKey());
       s.timers = keepTimers;
+      s.topicLog = keepTopics;
+      s.webBlocked = keepBlocked;
       if (!s.fails || typeof s.fails !== 'object') s.fails = { streak: {}, until: {} };
       s.fails.streak = s.fails.streak || {};
       s.fails.until = s.fails.until || {};
@@ -1499,10 +1510,23 @@ export default {
       return true;
     }
 
+    /** 最近打不开的网站（要验证、要登录、被拦），写给她看：xiachufang.com（要滑块验证） */
+    function webBlockedText(s) {
+      return Object.entries((s && s.webBlocked) || {})
+        .filter(([, v]) => v && v.at > Date.now() - 7 * 86_400_000)
+        .sort((a, b) => b[1].at - a[1].at)
+        .slice(0, 5)
+        .map(([host, v]) => `${host}${v.why ? `（${clip(v.why, 16)}）` : ''}`)
+        .join('、');
+    }
+    const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (error) { return ''; } };
+
     async function browseWeb(d, s) {
       const bo = api.use('browser-ops');
       if (!bo || typeof bo.runTask !== 'function') return { note: '想上网逛逛，但浏览器模块没开着', extra: { ok: false } };
-      const topic = clip(d.detail || d.why, 40) || '最近有什么好玩的';
+      // want 是她想弄明白的事（给读页面用），topic 是真正拿去搜的关键词
+      const want = clip(d.detail || d.why, 80) || '最近有什么好玩的';
+      const topic = clip(d.query, 40) || clip(d.detail || d.why, 40) || '最近有什么好玩的';
       const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(topic)}`;
       const r1 = await bo.runTask({ goal: topic, url: searchUrl });
       if (!r1 || !r1.ok) return { note: `想上网查「${topic}」，没打开：${clip((r1 && (r1.message || r1.error)) || '未知', 60)}`, extra: { ok: false } };
@@ -1515,7 +1539,7 @@ export default {
       try {
         const out = await ask(api.dsh, { key: 'web-pick', cfg: api.config(),
           system: '你在网上查东西，只输出 JSON。',
-          text: `你想查：${topic}\n下面是搜索结果页（→ 后面是链接）：\n${clip(page, 2500)}\n\n挑一个你最想点开的结果，回 {"url":"完整链接"}；都没意思就回 {"url":""}。`,
+          text: `你想查：${want}\n下面是搜索结果页（→ 后面是链接）：\n${clip(page, 2500)}\n${webBlockedText(s) ? `\n这些网站最近打不开：${webBlockedText(s)}\n` : ''}\n挑一个你最想点开的结果，回 {"url":"完整链接"}；都没意思就回 {"url":""}。`,
           maxTokens: 200,
           temperature: 0.7,
           timeoutMs,
@@ -1541,7 +1565,7 @@ export default {
       try {
         const out = await ask(api.dsh, { key: 'web-read', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
-          text: `你本来想查：${topic}\n你看到的页面：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}（${x.w}×${x.h}）`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
+          text: `你本来想查：${want}\n你看到的页面${link === searchUrl ? '（没点开任何一条，这是搜索结果页本身）' : `（${hostOf(link)}）`}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}（${x.w}×${x.h}）`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
           maxTokens: 300,
           temperature: 0.9,
           timeoutMs,
@@ -1553,6 +1577,16 @@ export default {
       const saw = clip(j.saw, 40) || clip(title, 40) || `搜了搜「${topic}」`;
       const feeling = clip(j.feeling, 40);
       const share = clip(j.share, 40);
+      const got = ['found', 'missed', 'blocked'].includes(String(j.got || '').trim()) ? String(j.got).trim() : 'found';
+      // 没拿到想要的：如实记成没查到 / 打不开，不算做成（later：不算动作坏了，不触发停用一天），也不记成「看过」
+      if (got === 'blocked') {
+        const host = link === searchUrl ? 'bing.com' : hostOf(link);
+        if (s && host) s.webBlocked = { ...(s.webBlocked || {}), [host]: { at: Date.now(), why: saw } };
+        return { note: `上网查「${topic}」：${host || '那个网站'}打不开（${saw}），没看到内容`, extra: { ok: false, later: true, output: link } };
+      }
+      if (got === 'missed') {
+        return { note: `上网查「${topic}」：没找到想要的（${saw}）${feeling ? '（' + feeling + '）' : ''}`, extra: { ok: false, later: true, output: link } };
+      }
       try {
         const mem = api.use('memory');
         if (mem && typeof mem.addEvent === 'function') {
@@ -2099,7 +2133,21 @@ export default {
       };
       const recent3h = (s.done || []).filter((x) => nowMs - (Number(x.at) || 0) <= 3 * 3600_000).slice(0, 8);
       const recentList = recent3h.length ? recent3h : (s.done || []).slice(0, 5);
-      const recent = recentList.map((x) => `${clock(x.at)}（${agoLabel(x.at)}）${x.action}${x.dry ? '（只是想了想，没动手）' : ''}：${x.note || ''}`);
+      const recent = recentList.map((x) => `${clock(x.at)}（${agoLabel(x.at)}）${x.action}${x.topic ? `〔${x.topic}〕` : ''}${x.dry ? '（只是想了想，没动手）' : ''}：${x.note || ''}`);
+      // 最近 24 小时同一件事（她自己写的话题名）花了几轮：只给事实，换不换由她定
+      const topicTally = new Map();
+      for (const x of s.topicLog || []) {
+        if (!x.topic || x.action === 'rest' || nowMs - (Number(x.at) || 0) > 24 * 3600_000) continue;
+        const t = topicTally.get(x.topic) || { n: 0, by: new Map() };
+        t.n += 1;
+        t.by.set(x.action, (t.by.get(x.action) || 0) + 1);
+        topicTally.set(x.topic, t);
+      }
+      const topicFacts = [...topicTally]
+        .filter(([, v]) => v.n >= 2)
+        .sort((a, b) => b[1].n - a[1].n)
+        .slice(0, 3)
+        .map(([k, v]) => `「${k}」${v.n} 轮（${[...v.by].map(([a, n]) => `${a} ${n}`).join('、')}）`);
       // 今天做够数的动作：从「可以接着做」的菜单里撤掉，免得它们反复出现在眼前被顺手选中
       const usedUp = usedUpToday(s);
       // 今天各类做了几次：软的自娱自乐不能占满一整天
@@ -2165,6 +2213,7 @@ export default {
         recent.length
           ? `${recent3h.length ? '最近 3 小时做过' : '你最近做过'}：\n${recent.join('\n')}\n（最近两三个小时刚做过或类似的事，没特别原因就换点新鲜的；真有新理由比如刚聊到，可以接着做）`
           : '你还没做过什么。',
+        topicFacts.length ? `最近 24 小时花在同一件事上的轮数：${topicFacts.join('；')}。` : '',
         usedUp.length ? `【今天已经做够的】${usedUp.join('、')}——今天一次都不许再做了，换一件没做过的。` : '',
         invented.length ? `你自己发明过的活动：${invented.join('、')}——可以接着做，也可以发明新的。` : '',
         memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
@@ -2192,7 +2241,7 @@ export default {
         '下面是你现在能做的事：',
         `- speak：找${ownerName}说句话——detail 写具体想说什么（平常天气只是背景不算由头，真要下雨提醒带伞、明显降温提醒添衣才算）；安排里有对应的那条就填 agendaId`,
         cantDo(s, 'bili') ? '' : '- bili：去 B 站看看，找点有趣的',
-        cantDo(s, 'web') ? '' : '- web：自己上网查点东西——detail 写你想查什么（「最近有什么好看的冷门动画」「番茄炒蛋先放蛋还是先放番茄」），会去搜一下、点开一条看',
+        cantDo(s, 'web') ? '' : `- web：自己上网查点东西——detail 写你想查什么（「最近有什么好看的冷门动画」「番茄炒蛋先放蛋还是先放番茄」），query 写拿去搜索引擎搜的几个关键词，会去搜一下、点开一条看${webBlockedText(s) ? `（最近打不开的网站：${webBlockedText(s)}）` : ''}`,
         cantDo(s, 'diary') ? '' : `- diary：写一篇只给自己看的日记（一天最多 ${DIARY_MAX_PER_DAY} 篇）——detail 写想写什么`,
         cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线，上面装了 B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机，按你自己的兴趣打开看看、随手记两句都行',
         cantDo(s, 'draw') ? '' : '- draw：给自己画一张图',
@@ -2202,7 +2251,9 @@ export default {
         `- 生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……自己起个短名字当 action，detail 写清楚做了什么（「楼下面馆吃了碗牛肉面」）。这些算你真的过了这一段，之后聊天能提起来。${cantDo(s, 'outing') ? '' : '要出门去具体的店、公园就用 outing，会挑附近真的地方。'}`,
         '',
         '只回一个 JSON：',
-        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
+        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
+        'agendaDone：填了 agendaId 才看——这一轮做完，那条是不是就算做完了；只是为它查资料、看教程、做准备，写 false。',
+        'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：只有 web 才填，拿去搜索引擎搜的几个关键词。',
         'nextMinutes 是你想大概多久后再醒（分钟）：这件事要做很久就写长点，只是歇一下就写短点，不确定就写 0。',
         'busyMin / canPause / energy 说的是这件事本身，按你自己的情况填：busyMin 大概要占你多少分钟（不占手就 0）；canPause 这期间有人找你，能不能随手放下先回（true / false）；energy 做完精力大概怎么变（-10 到 +25 的整数，回血就正，累人就负）。',
         replansLeft > 0
@@ -2329,6 +2380,9 @@ export default {
         if (result.extra && result.extra.ok === false) {
           item.note = clip(result.note, 40);
           item.tries = (Number(item.tries) || 0) + 1;
+        } else if (d.agendaDone === false) {
+          // 只是为这条做了准备（查配方、看教程）：记下做过什么，这条本身还没做
+          item.progress = clip(result.note, 50);
         } else {
           item.state = 'done';
           item.note = clip(result.note, 60);
@@ -2414,9 +2468,10 @@ export default {
         if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause };
       }
       s.done = [
-        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', ...(item ? { agendaId: item.id } : {}) },
+        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
         ...(s.done || []),
       ].slice(0, 50);
+      if (d.topic && d.action !== 'rest') s.topicLog = [{ at, topic: d.topic, action: d.action }, ...(s.topicLog || [])].slice(0, 60);
       // 空想和歇着都不覆盖「留给自己的话」——否则那句话会在下次提示词里自己喂自己
       if (!dry && !resting) s.note = d.why || '';
       s.nextWakeAt = at + delay * 60_000;
@@ -2431,7 +2486,8 @@ export default {
         note: result.note,
         output: result.extra && result.extra.output ? String(result.extra.output).slice(0, 600) : '',
         nextMinutes: delay,
-        ...(item ? { agendaId: item.id } : {}),
+        ...(d.topic ? { topic: d.topic } : {}),
+        ...(item ? { agendaId: item.id, agendaDone: d.agendaDone !== false } : {}),
         ...(agendaChanges.length ? { agenda: agendaChanges } : {}),
       });
 
@@ -3552,7 +3608,7 @@ export default {
       const q = api.core && api.core.http && typeof api.core.http.query === 'function' ? api.core.http.query(req) : {};
       const action = String((q && q.action) || '').trim().slice(0, 16);
       if (!action) return { ok: false, message: '要给 action' };
-      const d = { action, detail: String((q && q.detail) || '').slice(0, 200), why: '测试', steps: [], kind: '', nextMinutes: 0, agendaId: '', ops: [] };
+      const d = { action, detail: String((q && q.detail) || '').slice(0, 200), query: String((q && q.query) || '').slice(0, 40), why: '测试', steps: [], kind: '', nextMinutes: 0, agendaId: '', ops: [] };
       const scratch = load();
       scratch.__trial = true; // 测试：出门不记「去过」
       waking = true;

@@ -185,8 +185,12 @@ function itemLine(x, curSlot) {
   let state = '还没做';
   if (x.state === 'done') state = '做了' + (x.note ? '：' + x.note : '');
   else if (x.state === 'dropped') state = '划掉了' + (x.note ? '：' + x.note : '');
-  else if (slotRank(x.slot) < slotRank(curSlot)) state = '时段过了还没做';
-  else if (x.note) state = (Number(x.tries) > 0 ? '还没做成：' : '还没做（') + x.note + (Number(x.tries) > 0 ? '' : '）');
+  else {
+    if (slotRank(x.slot) < slotRank(curSlot)) state = '时段过了还没做';
+    else if (x.note) state = (Number(x.tries) > 0 ? '还没做成：' : '还没做（') + x.note + (Number(x.tries) > 0 ? '' : '）');
+    // 为这条做过准备（查资料、看教程），但这件事本身还没做
+    if (x.progress) state += `；为它做过：${x.progress}`;
+  }
   return `- [${x.id}] ${SLOT_LABEL[x.slot] || ''}${x.at ? ' ' + fmtClock(x.at) : ''} · ${x.what}${x.why ? `（${x.why}）` : ''}${tags.length ? `〔${tags.join('，')}〕` : ''} —— ${state}`;
 }
 
