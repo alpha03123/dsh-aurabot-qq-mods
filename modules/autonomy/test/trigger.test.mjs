@@ -5,7 +5,7 @@
  * 全部用假 api 跑，不碰真模型、不碰真手机。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -43,6 +43,13 @@ function makeApi(over = {}) {
       commands[def.name] = def
     },
     tool: () => {},
+    rule: () => () => {},
+    context: () => () => {},
+    lib: () => ({}),
+    has: () => false,
+    open: () => {},
+    sendImage: async () => ({ ok: false }),
+    setConfig: () => {},
     defineTool: (t) => t,
     use: () => null,
     isOwner: (id) => over.owner === id,
@@ -129,6 +136,9 @@ test('超时降级：模型 hang 住时真取消、不抛、及时返回', async
   }
   // 超时压到 1 秒、重试压到 2 次，整轮几秒内必须结束；awakeFrom/awakeTo 固定为全天（CI 是 UTC 时区，不固定会撞夜间静默短路，2026-11-10 CI 实测）
   const c = makeApi({ owner: '3205277184', settings: { enabled: true, awakeFrom: 0, awakeTo: 24, askTimeoutSec: 1, grants: { model: true, phone: false } }, dsh: hang })
+  // 0.7 起每天第一次醒会先定计划（计划调用有 30 秒下限，写一整天计划本来就要更久）；
+  // 这里预先放一份「今天已定好」的计划，只测醒来决策这一次调用的超时与取消
+  writeFileSync(join(c.dir, 'autonomy.json'), JSON.stringify({ day: new Date().toDateString(), agenda: { date: new Date().toDateString(), theme: '', items: [], planned: true, planTries: 0, replans: 0, speaks: 0, recap: '', nextId: 1 } }))
   try {
     const out = autonomy.setup(c.api)
     const started = Date.now()
