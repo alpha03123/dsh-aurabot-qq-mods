@@ -56,7 +56,7 @@ import {
   statusLine,
 } from './lib/agenda.mjs';
 import { PLACE_KINDS, pickKind, searchAmap, searchOsm, choosePlace, fmtDistance } from './lib/outing.mjs';
-import { htmlArticle } from './lib/webtext.mjs';
+import { SEARCH_BASE_URL, SEARCH_MODEL, buildSearchBody, parseSearchResponse, searchPageText } from './lib/websearch.mjs';
 
 import crypto from 'node:crypto';
 
@@ -531,7 +531,7 @@ export default {
     weatherLon: 121.544,
     // 本地改：出门（真实地点）。家的位置用 WGS84 经纬度；高德 key 没填就只用 OSM
     outingEnabled: false,
-    webSearch: 'dsh',
+    webSearch: 'deepseek',
     homeName: '',
     homeLat: '',
     homeLon: '',
@@ -543,7 +543,7 @@ export default {
     { key: 'weatherCity', label: '她住的城市（查天气用）', type: 'text', hint: '写中文城市名，比如 宁波。改了城市就把下面两个经纬度清空，会自动重新查。留空 = 不看天气' },
     { key: 'weatherLat', label: '纬度（可留空自动查）', type: 'number' },
     { key: 'weatherLon', label: '经度（可留空自动查）', type: 'number' },
-    { key: 'webSearch', label: '上网查东西用什么', type: 'select', options: [{ value: 'dsh', label: 'DSH 联网搜索（DeepSeek 官方搜索 + 直接读网页，不开浏览器）' }, { value: 'browser', label: 'Bing + 专用浏览器（要开 browser-ops）' }], hint: 'DSH 联网搜索用的是 DSH 里存的 DeepSeek key，每搜一次多花一次模型调用；要 JS 才显示正文的网页读不到。' },
+    { key: 'webSearch', label: '上网查东西用什么', type: 'select', options: [{ value: 'deepseek', label: 'DeepSeek 联网搜索（搜索和读网页都在 DeepSeek 那边，回来总结 + 来源）' }, { value: 'browser', label: 'Bing + 专用浏览器（要开 browser-ops）' }], hint: '用 DSH 里存的 DeepSeek key（和 DSH 自己的联网搜索同一把），每次大约 1 万输入 token；不开浏览器，也不会给她发网页图片。' },
     { key: 'outingEnabled', label: '允许她出门（去附近真实的店 / 公园）', type: 'switch', hint: '要先填下面「住的地方」的经纬度。地点来自高德（填了 key 时）或 OpenStreetMap；店里的经历由模型按真实店名、距离、天气来写。' },
     { key: 'homeName', label: '住的地方（给她看的名字，比如「月湖边上」）', type: 'text', hint: '别填真实住址，选一片街区 / 商圈就好——她会在聊天里提到去过的地方' },
     { key: 'homeLat', label: '住处纬度（WGS84）', type: 'number' },
@@ -1554,23 +1554,27 @@ export default {
       }
     }
 
-    /** 上网走哪条路：dsh = DSH 的联网搜索服务（ctx.web，现在是 DeepSeek 官方联网搜索）+ HTTP 抓正文；browser = Bing + 专用浏览器 */
-    const webMode = () => (String(cfg().webSearch || 'dsh') === 'browser' ? 'browser' : 'dsh');
-    const dshWeb = () => {
+    /** 上网走哪条路：deepseek = 直接问 DeepSeek 官方联网搜索（搜索、读网页都在那边做完，回来总结 + 来源）；browser = Bing + 专用浏览器 */
+    const webMode = () => (String(cfg().webSearch || 'deepseek') === 'browser' ? 'browser' : 'deepseek');
+
+    /** DSH 里存的 DeepSeek key（和 DSH 自己的联网搜索同一把）；没有就看环境变量 */
+    async function deepseekKey() {
       try {
-        const w = api.dsh && typeof api.dsh.get === 'function' ? api.dsh.get('web') : null;
-        return w && typeof w.search === 'function' ? w : null;
-      } catch (error) {
-        return null;
-      }
-    };
+        const cred = api.dsh && typeof api.dsh.get === 'function' ? api.dsh.get('credentials') : null;
+        if (cred && typeof cred.resolve === 'function') {
+          const r = await cred.resolve('DEEPSEEK_API_KEY');
+          if (r && r.value) return String(r.value);
+        }
+      } catch (error) {}
+      return String(process.env.DEEPSEEK_API_KEY || '');
+    }
 
     async function browseWeb(d, s) {
       // want 是她想弄明白的事（给读页面用），topic 是真正拿去搜的关键词
       const want = clip(d.detail || d.why, 80) || '最近有什么好玩的';
       const topic = clip(d.query, 40) || clip(d.detail || d.why, 40) || '最近有什么好玩的';
       const timeoutMs = Math.max(20, Number(cfg().askTimeoutSec) || 45) * 1000;
-      const r = webMode() === 'browser' ? await searchByBrowser(want, topic, s, timeoutMs) : await searchByDsh(want, topic, s, timeoutMs);
+      const r = webMode() === 'browser' ? await searchByBrowser(want, topic, s, timeoutMs) : await searchByDeepSeek(want, topic);
       if (r.fail) return r.fail;
       return finishWeb({ want, topic, s, timeoutMs, ...r });
     }
@@ -1594,78 +1598,46 @@ export default {
       }
     }
 
-    /**
-     * 用 DSH 的 HTTP 抓取读一页。DSH 不跟跨域重定向（http→https、子域名跳主站都算），
-     * 遇到就自己一跳一跳问出最终地址（每跳都查是不是公网），再交给 DSH 读。
-     */
-    async function fetchPage(web, url) {
-      const net = (() => { try { return api.lib('core/net.js'); } catch (error) { return null; } })();
-      const guard = async (u) => { if (net && typeof net.assertPublicUrl === 'function') await net.assertPublicUrl(u); };
-      let u = String(url).replace(/^http:\/\//i, 'https://');
-      await guard(u);
+    /** 问 DeepSeek 联网搜索：一次请求拿回来源 + 按网页内容写的总结（不自己开网页） */
+    async function searchByDeepSeek(want, topic) {
+      const key = await deepseekKey();
+      if (!key) return { fail: { note: '想上网查东西，但 DSH 里没存 DeepSeek 的 key（联网搜索要用）', extra: { ok: false } } };
+      const body = buildSearchBody({ want, query: topic });
+      const t0 = Date.now();
+      let parsed;
+      let errMsg = '';
       try {
-        return await web.fetch({ url: u });
+        const res = await fetch(`${String(process.env.DEEPSEEK_SEARCH_BASE_URL || SEARCH_BASE_URL).replace(/\/$/, '')}/messages`, {
+          method: 'POST',
+          redirect: 'error',
+          signal: AbortSignal.timeout(90_000),
+          headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', 'x-api-key': key, authorization: `Bearer ${key}` },
+          body: JSON.stringify(body),
+        });
+        const text = await res.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch (error) {}
+        parsed = parseSearchResponse(json);
+        if (!res.ok && parsed.ok) parsed = { ...parsed, ok: false, error: `HTTP ${res.status}` };
+        if (!res.ok && !json) parsed.error = `HTTP ${res.status}`;
       } catch (error) {
-        if (!/cross-origin redirect|REDIRECT/i.test(`${error.code || ''} ${error.message}`)) throw error;
+        errMsg = error.name === 'TimeoutError' ? '超时了' : error.message;
+        parsed = { ok: false, error: errMsg, summary: '', sources: [], truncated: false, searches: 0, usage: null };
       }
-      for (let hop = 0; hop < 5; hop++) {
-        const r = await fetch(u, { redirect: 'manual', signal: AbortSignal.timeout(15000), headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36', 'accept-language': 'zh-CN,zh;q=0.9' } });
-        try { await r.body?.cancel(); } catch (error) {}
-        const loc = [301, 302, 303, 307, 308].includes(r.status) ? r.headers.get('location') : null;
-        if (!loc) break;
-        u = new URL(loc, u).href;
-        await guard(u);
-      }
-      return await web.fetch({ url: u });
-    }
-
-    /** DSH 联网搜索：拿到标题和链接，点开时用 DSH 的 HTTP 抓取读正文（不开浏览器） */
-    async function searchByDsh(want, topic, s, timeoutMs) {
-      const web = dshWeb();
-      if (!web) return { fail: { note: '想上网查东西，但 DSH 的联网搜索服务不在', extra: { ok: false } } };
-      let sources = [];
+      // 留底：和其他后台模型调用一样能在 traces 里查
       try {
-        const res = await web.search({ query: topic, maxResults: 8 });
-        sources = (res && Array.isArray(res.sources) ? res.sources : []).filter((x) => x && x.url);
-      } catch (error) {
-        return { fail: { note: `想上网查「${topic}」，搜索没成：${clip(error.message, 60)}`, extra: { ok: false } } };
-      }
-      if (!sources.length) return { fail: { note: `上网查「${topic}」：什么也没搜到`, extra: { ok: false, later: true } } };
-      const listText = sources.map((x, i) => `[${i + 1}] ${clip(x.title || '', 60)} → ${x.url}${x.snippet ? `\n    ${clip(x.snippet, 120)}` : ''}`).join('\n');
-      let page = listText;
-      let link = '';
-      let title = '';
-      let images = [];
-      let tried = '';
-      const failed = [];
-      const failedHosts = [];
-      for (const u of await pickResults(want, listText, s, timeoutMs, 3)) {
-        tried = tried || u;
-        try {
-          const f = await fetchPage(web, u);
-          if (!f || !f.body) { failed.push(`${hostOf(u)}（没内容）`); continue; }
-          if (Number(f.statusCode) >= 400) { failed.push(`${hostOf(u)}（HTTP ${f.statusCode}）`); failedHosts.push(hostOf(u)); continue; }
-          const art = f.body.kind === 'html' ? htmlArticle(f.body.content, f.url || u) : { title: '', text: clip(String(f.body.content || ''), 4000), images: [] };
-          if (art.text.length < 200) {
-            // 太短：多半是验证页、登录页、要 JS 才出正文的页面 —— 原样给她看是哪种，再试下一条
-            failed.push(`${hostOf(f.url || u)}（只有几句：${clip(art.title || art.text, 40)}）`);
-            failedHosts.push(hostOf(f.url || u));
-            tried = f.url || u;
-            continue;
-          }
-          link = String(f.url || u);
-          title = art.title;
-          page = `页面：${clip(art.title, 80)}\n正文：${art.text}`;
-          images = art.images;
-          break;
-        } catch (error) {
-          failed.push(`${hostOf(u)}（${clip(error.message, 30)}）`);
-          failedHosts.push(hostOf(u));
-          api.log.debug?.(`自主生活：打开 ${hostOf(u)} 没成 ${error.message}`);
-        }
-      }
-      if (!link && failed.length) page = `${listText}\n\n你点了这几条，都没打开：${failed.join('；')}`;
-      return { page, link, title, images, opened: !!link, blockedGuess: link || tried, failedHosts: link ? [] : failedHosts.filter(Boolean) };
+        api.lib('core/trace.js').writeTrace({ kind: 'model', key: 'web-search', caller: 'autonomy', provider: 'deepseek-official', model: body.model, system: body.system, input: body.messages[0].content[0].text, output: parsed.summary, ms: Date.now() - t0, error: parsed.ok ? '' : parsed.error, usage: parsed.usage, sources: parsed.sources.length, searches: parsed.searches });
+      } catch (error) {}
+      if (!parsed.ok) return { fail: { note: `想上网查「${topic}」，搜索没成：${clip(parsed.error, 60)}`, extra: { ok: false } } };
+      return {
+        page: searchPageText(parsed),
+        link: (parsed.sources[0] && parsed.sources[0].url) || '',
+        title: '',
+        images: [],
+        opened: false,
+        label: '（搜索引擎读完网页后按内容写的总结，后面是来源）',
+        blockedGuess: '',
+      };
     }
 
     /** 老办法：Bing 搜索页 + 专用浏览器点开 */
@@ -1701,12 +1673,12 @@ export default {
     }
 
     /** 读完记下来：看到了什么、什么感觉、想不想之后跟主人聊；没查到 / 打不开如实记 */
-    async function finishWeb({ want, topic, s, timeoutMs, page, link, title, images, opened, blockedGuess, failedHosts = [] }) {
+    async function finishWeb({ want, topic, s, timeoutMs, page, link, title, images, opened, blockedGuess, failedHosts = [], label = '' }) {
       let j = {};
       try {
         const out = await ask(api.dsh, { key: 'web-read', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
-          text: `你本来想查：${want}\n你看到的${opened ? `页面（${hostOf(link)}）` : '（没点开任何一条，这是搜索结果列表本身）'}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}${x.w && x.h ? `（${x.w}×${x.h}）` : ''}`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
+          text: `你本来想查：${want}\n你看到的${label || (opened ? `页面（${hostOf(link)}）` : '（没点开任何一条，这是搜索结果列表本身）')}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}${x.w && x.h ? `（${x.w}×${x.h}）` : ''}`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
           maxTokens: 600,
           temperature: 0.9,
           timeoutMs,
@@ -2020,8 +1992,8 @@ export default {
     /** 动作背后的模块：没开就不列、不许选 */
     const ACTION_MODULE = { bili: 'bili', web: 'browser-ops', draw: 'imagegen', phone: 'phone' };
     const moduleMissing = (action) => {
-      // 上网：默认走 DSH 的联网搜索服务，只有设成 browser 才要浏览器模块
-      if (action === 'web' && webMode() === 'dsh') return !dshWeb();
+      // 上网：默认问 DeepSeek 联网搜索（缺 key 时动作自己会报），只有设成 browser 才要浏览器模块
+      if (action === 'web' && webMode() === 'deepseek') return false;
       const id = ACTION_MODULE[action];
       if (!id) return false;
       if (!api.has(id)) return true;
