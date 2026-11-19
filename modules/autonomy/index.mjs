@@ -610,7 +610,8 @@ export default {
     /**
      * 想起几件相关的事：拿这次要想的事（今天的安排、刚做过的、正在弄的）去记忆库按相关度搜（关键词 + 向量），
      * 她做过的、看过的、在聊天里说过的自己的事（「跟主人说过蛋糕已经做成了」）、关于主人的事都在里面；
-     * 不够再用最近做过的事补满。shown:false —— 小脑每轮都想一遍不算「被想起」，不影响遗忘曲线。
+     * 不够再用最近做过的事补满。看过的视频/网页最多占 2 条（记忆库里它们最多，不限就会挤掉她自己做过、说过的事）。
+     * shown:false —— 小脑每轮都想一遍不算「被想起」，不影响遗忘曲线。
      */
     async function recallHints(limit = 6, query = '') {
       const out = [];
@@ -624,9 +625,13 @@ export default {
           try {
             vh = typeof mem.vectorHits === 'function' ? (await mem.vectorHits(q)) || [] : [];
           } catch (error) {}
-          for (const h of mem.recall(q, { limit, where: '自主生活', shown: false, vectorHits: vh }) || []) {
+          let seenN = 0;
+          for (const h of mem.recall(q, { limit: limit * 3, where: '自主生活', shown: false, vectorHits: vh }) || []) {
+            if (out.length >= limit) break;
             const m = h && h.it;
             if (!m || !m.text || have.has(m.id)) continue;
+            if (m.kind === 'seen' && seenN >= 2) continue;
+            if (m.kind === 'seen') seenN++;
             have.add(m.id);
             out.push(hintLine(m));
           }
@@ -2103,8 +2108,8 @@ export default {
         .slice(0, 4)
         .map(([k, v]) => `${k}（${Number(v.count) || 1}次）`);
       const mood = moodLine();
-      // 想起相关的事：拿今天的安排、最近做过的、正在弄的去搜
-      const memHints = await recallHints(6, [...((s.agenda && s.agenda.items) || []).filter((x) => x.state !== 'dropped').map((x) => x.what), ...recentList.slice(0, 4).map((x) => x.note), s.project && s.project.name].filter(Boolean).join(' '));
+      // 想起相关的事：拿今天的安排、正在弄的去搜（最近做过的事上面已经列着，不拿来搜，免得搜回它自己）
+      const memHints = await recallHints(6, [...((s.agenda && s.agenda.items) || []).filter((x) => x.state !== 'dropped').map((x) => x.what), s.project && s.project.name].filter(Boolean).join(' '));
       // 这一轮允不允许「只想不做」：今天想过太多次、或者上一次醒来就只是在想 —— 都不许再想
       const thinkUsed = Number(s.thinkToday) || 0;
       const lastWasDry = !!(s.done && s.done[0] && s.done[0].dry);
