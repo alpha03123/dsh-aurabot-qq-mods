@@ -105,8 +105,12 @@ function writeJson(file, data) {
 /** 决策调用的默认超时：模型卡住时不能把整轮醒着的时间耗掉 */
 const ASK_TIMEOUT_MS = 45_000;
 
-/** 问一次宿主模型（不进会话）：后台决策用。超时抛错，由上层降级处理。 */
-async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, timeoutMs = ASK_TIMEOUT_MS, cfg = null }) {
+/** 小脑留底（核心 core/trace.js）：setup 时接上；拿不到就不记，不影响调用 */
+let traceLib = null;
+
+/** 问一次宿主模型（不进会话）：后台决策用。超时抛错，由上层降级处理。
+ *  key：用途，写进小脑留底；reasoningEffort 目前不会传给模型，只记在留底里（排查用）。 */
+async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, timeoutMs = ASK_TIMEOUT_MS, cfg = null, key = '', reasoningEffort = undefined }) {
   const llm = dsh.llm || (typeof dsh.get === 'function' ? dsh.get('llm') : null);
   if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有 llm 服务');
   // 本地改（2026-11-17）：先用 Aurabot 里选的模型（和聊天同一个），没选才用 DSH 的默认模型
@@ -130,6 +134,14 @@ async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, time
     },
   ];
   let out = '';
+  let reasoning = '';
+  let usage = null;
+  let finish = '';
+  const types = {};
+  const t0 = Date.now();
+  let failed = '';
+  let caller = '';
+  try { caller = traceLib && typeof traceLib.callerOf === 'function' ? traceLib.callerOf() : ''; } catch (error) {}
   // 超时兜底，并且**真的取消底层请求**：只放一个计时器不去 abort，流会一直在后台挂着，
   // 模型服务卡死时整轮「醒着」就永远结束不了，排程也跟着停摆。
   // 宿主 llm.stream 的参数里有 signal（AbortSignal），用它。
@@ -149,7 +161,11 @@ async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, time
       signal: ac.signal,
     })) {
       if (!chunk) continue;
+      types[chunk.type] = (types[chunk.type] || 0) + 1;
       if (chunk.type === 'text-delta') out += chunk.text;
+      if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') reasoning += chunk.text;
+      if (chunk.type === 'usage') usage = chunk.usage || null;
+      if (chunk.type === 'finish') finish = JSON.stringify(chunk.reason || {}).slice(0, 120);
       if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
         const f = chunk.reason.failure || {};
         throw new Error('模型报错：' + (f.message || f.code || '未知'));
@@ -158,16 +174,50 @@ async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, time
   } catch (error) {
     // abort 抛出来的名字五花八门（AbortError / 自定义 reason），统一成一句人话
     if (ac.signal.aborted) {
-      throw new Error('模型调用超时（' + Math.round(timeoutMs / 1000) + ' 秒）');
+      failed = '模型调用超时（' + Math.round(timeoutMs / 1000) + ' 秒）';
+      writeAskTrace();
+      throw new Error(failed);
     }
+    failed = String((error && error.message) || error);
+    writeAskTrace();
     throw error;
   } finally {
     clearTimeout(timer);
   }
   const result = out.trim();
   // 空返回要显式报错，否则会被当成「她没想好」，看起来像发呆
+  if (!result) failed = '模型返回空';
+  writeAskTrace();
   if (!result) throw new Error('模型返回空（多半和 QQ 会话并发撞上了）');
   return result;
+
+  function writeAskTrace() {
+    try {
+      if (!traceLib || typeof traceLib.writeTrace !== 'function') return;
+      traceLib.writeTrace({
+        kind: 'ask',
+        source: 'autonomy',
+        key,
+        caller,
+        provider,
+        model,
+        maxTokens,
+        temperature,
+        timeoutMs,
+        reasoningEffortRequested: reasoningEffort ?? null,
+        reasoningEffortSent: null,
+        system,
+        input: text,
+        output: out.trim(),
+        reasoning,
+        finish,
+        usage,
+        types,
+        ms: Date.now() - t0,
+        error: failed,
+      });
+    } catch (error) {}
+  }
 }
 
 const ACTIONS = ['idle', 'speak', 'bili', 'web', 'diary', 'phone', 'draw', 'think', 'rest', 'outing'];
@@ -506,6 +556,7 @@ export default {
   ],
 
   setup(api) {
+    try { traceLib = api.lib('core/trace.js'); } catch (error) { traceLib = null; }
     const dshHome = path.resolve(api.dataDir(), '..', '..', '..', '..');
 
     const stateFile = () => path.join(api.dataDir(), 'autonomy.json');
@@ -1045,6 +1096,7 @@ export default {
       let v = null;
       try {
         const out = await llm.askModel(api.dsh, {
+          key: 'share-image-check',
           cfg: api.config(),
           system: '你在看一张网上的图片，判断适不适合拿给朋友看。只输出 JSON。',
           text: `你在网上看「${title || topic}」时看到这张图${img.alt ? `（网页上的说明：${img.alt}）` : ''}，本来想拿给${name}看。先认真看图本身：图里是什么？适不适合发给他——不雅、血腥、广告、二维码、看不清、和你以为的不一样，都不发。只输出 JSON：{"ok":true 或 false,"what":"图里是什么，20 字以内","why":"为什么想给他看 / 为什么不发，一句"}`,
@@ -1302,14 +1354,14 @@ export default {
       const sys = '你是一个有自己生活的角色，刚出门回来。只输出 JSON。';
       if (canSee) {
         try {
-          j = parseJsonLoose(await llm.askModel(api.dsh, { cfg: api.config(), system: sys, text, images: [{ data: photo.buf.toString('base64'), mediaType: photo.mediaType }], maxTokens: 500, temperature: 0.9 }));
+          j = parseJsonLoose(await llm.askModel(api.dsh, { key: 'outing-story-photo', cfg: api.config(), system: sys, text, images: [{ data: photo.buf.toString('base64'), mediaType: photo.mediaType }], maxTokens: 500, temperature: 0.9 }));
         } catch (error) {
           api.log.warn('自主生活：带照片写出门经历失败，改用纯文字 ' + error.message);
         }
       }
       if (!j) {
         try {
-          const out = await ask(api.dsh, { cfg: api.config(),
+          const out = await ask(api.dsh, { key: 'outing-story', cfg: api.config(),
             system: sys,
             text: canSee ? text.split('\n').filter((l) => !/照片/.test(l)).join('\n') + '\n' + plainJson : text,
             maxTokens: 400,
@@ -1373,7 +1425,7 @@ export default {
       let images = [];
       // 从结果里挑一条点开（模型不挑或打不开，就只看搜索结果页）
       try {
-        const out = await ask(api.dsh, { cfg: api.config(),
+        const out = await ask(api.dsh, { key: 'web-pick', cfg: api.config(),
           system: '你在网上查东西，只输出 JSON。',
           text: `你想查：${topic}\n下面是搜索结果页（→ 后面是链接）：\n${clip(page, 2500)}\n\n挑一个你最想点开的结果，回 {"url":"完整链接"}；都没意思就回 {"url":""}。`,
           maxTokens: 200,
@@ -1399,7 +1451,7 @@ export default {
       // 读完记下来：看到了什么、什么感觉、想不想之后跟主人聊
       let j = {};
       try {
-        const out = await ask(api.dsh, { cfg: api.config(),
+        const out = await ask(api.dsh, { key: 'web-read', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
           text: `你本来想查：${topic}\n你看到的页面：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}（${x.w}×${x.h}）`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），30 字以内，别写「一篇文章」「一些推荐」这种笼统的","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
           maxTokens: 300,
@@ -1501,7 +1553,7 @@ export default {
       }
       if (!body) {
         try {
-          body = await ask(api.dsh, { cfg: api.config(), system: '你是一个有自己生活的角色，在写只给自己看的日记。只输出日记正文。', text, maxTokens: 800, temperature: 0.95, timeoutMs: Math.max(30, Number(cfg().askTimeoutSec) || 45) * 1000 });
+          body = await ask(api.dsh, { key: 'diary-fallback', cfg: api.config(), system: '你是一个有自己生活的角色，在写只给自己看的日记。只输出日记正文。', text, maxTokens: 800, temperature: 0.95, timeoutMs: Math.max(30, Number(cfg().askTimeoutSec) || 45) * 1000 });
         } catch (error) {
           return { note: `想写日记，没写成：${error.message}`, extra: { ok: false } };
         }
@@ -1855,7 +1907,7 @@ export default {
       }
       if (!j) {
         try {
-          out = await ask(api.dsh, { cfg: api.config(),
+          out = await ask(api.dsh, { key: 'plan-fallback', cfg: api.config(),
             system: '你是一个有自己生活的角色，刚睡醒，在想今天怎么过。只输出 JSON。',
             text,
             maxTokens: 1800,
@@ -2077,6 +2129,7 @@ export default {
       ].filter(Boolean).join('\n');
 
       const askArgs = {
+        key: 'wake',
         system: '你是一个有自己生活的角色。现在是你的私人时间，没人跟你说话，你只决定自己接下来做什么。只输出 JSON。',
         text,
         cfg: api.config(),
@@ -2844,7 +2897,7 @@ export default {
         `只回 JSON：{"minutes":0,"why":"一句话"} —— minutes 是过几分钟再看（0 = 现在就回，最多 ${leftMin}）。`,
       ].filter(Boolean).join('\n');
       try {
-        const out = await ask(api.dsh, { cfg: api.config(), system: `你是${me.name || '一个有自己生活的角色'}，手机响了，决定什么时候看。只输出 JSON。`, text, maxTokens: 200, temperature: 0.7, timeoutMs: 30_000 });
+        const out = await ask(api.dsh, { key: 'hold', cfg: api.config(), system: `你是${me.name || '一个有自己生活的角色'}，手机响了，决定什么时候看。只输出 JSON。`, text, maxTokens: 200, temperature: 0.7, timeoutMs: 30_000 });
         const j = parseJsonLoose(out) || {};
         const m = Number(j.minutes);
         const minutes = Number.isFinite(m) ? Math.max(0, Math.min(leftMin, 60, Math.round(m))) : 0;
