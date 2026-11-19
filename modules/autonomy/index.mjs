@@ -1521,6 +1521,36 @@ export default {
     }
     const hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (error) { return ''; } };
 
+    /**
+     * 点开的页面读正文：browser-ops 的 dom 快照是给「操作网页」用的（先列 120 个链接按钮、正文只留 1200 字垫底），
+     * 文章页读进来几乎全是导航链接。这里优先拿 article / main，没有就挑段落文字最多的那一块。
+     */
+    async function readArticle(bo) {
+      if (!bo || typeof bo.evaluate !== 'function') return '';
+      try {
+        const r = await bo.evaluate(`(() => {
+          const clean = (t) => String(t || '').replace(/[ \\t]+/g, ' ').replace(/\\n\\s*\\n+/g, '\\n').trim();
+          const textLen = (el) => [...el.querySelectorAll('p')].reduce((n, p) => n + (p.innerText || '').trim().length, 0);
+          let node = [...document.querySelectorAll('article, main, [role="main"]')].sort((a, b) => textLen(b) - textLen(a))[0] || null;
+          if (!node || textLen(node) < 200) {
+            let best = null, bestLen = 0;
+            for (const el of document.querySelectorAll('div, section')) {
+              let len = 0;
+              for (const p of el.children) if (p.tagName === 'P' || p.tagName === 'SECTION') len += (p.innerText || '').trim().length;
+              if (len > bestLen) { bestLen = len; best = el; }
+            }
+            if (best && bestLen >= 200) node = best;
+          }
+          return { title: document.title, text: clean((node || document.body || {}).innerText).slice(0, 4000) };
+        })()`, 15000);
+        const text = String((r && r.text) || '').trim();
+        return text ? `页面：${clip(String((r && r.title) || ''), 80)}\n正文：${text}` : '';
+      } catch (error) {
+        api.log.warn('自主生活：读正文失败，退回页面快照 ' + error.message);
+        return '';
+      }
+    }
+
     async function browseWeb(d, s) {
       const bo = api.use('browser-ops');
       if (!bo || typeof bo.runTask !== 'function') return { note: '想上网逛逛，但浏览器模块没开着', extra: { ok: false } };
@@ -1548,9 +1578,10 @@ export default {
         if (/^https?:\/\//i.test(u) && u !== searchUrl) {
           const nav = await bo.navigate(u);
           if (nav && nav.ok) {
-            const snap = await bo.snapshot({ mode: 'dom' });
-            if (snap && snap.ok && snap.text) {
-              page = String(snap.text);
+            const article = await readArticle(bo);
+            const snap = article ? null : await bo.snapshot({ mode: 'dom' });
+            if (article || (snap && snap.ok && snap.text)) {
+              page = article || String(snap.text);
               link = String(nav.url || u);
               title = String(nav.title || '');
               images = await pageImages(bo);
