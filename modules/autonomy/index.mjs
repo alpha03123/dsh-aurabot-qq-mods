@@ -607,25 +607,60 @@ export default {
       }
     }
 
-    /** 从记忆库里挑几条跟她自己有关的，让每次醒来能接上之前的事 */
-    function recallHints(limit = 6) {
+    /**
+     * 想起几件相关的事：拿这次要想的事（今天的安排、刚做过的、正在弄的）去记忆库按相关度搜（关键词 + 向量），
+     * 她做过的、看过的、在聊天里说过的自己的事（「跟主人说过蛋糕已经做成了」）、关于主人的事都在里面；
+     * 不够再用最近做过的事补满。shown:false —— 小脑每轮都想一遍不算「被想起」，不影响遗忘曲线。
+     */
+    async function recallHints(limit = 6, query = '') {
+      const out = [];
+      const have = new Set();
       try {
-        // 走 memory 模块的接口：记忆库换成 SQLite 后 memories.json 已经不在了
         const mem = api.use('memory');
-        const list = mem && typeof mem.recentEvents === 'function' ? mem.recentEvents(72, 60) || [] : [];
-        return list
-          .filter((m) => m && typeof m.text === 'string' && m.text.trim())
-          .filter((m) => {
-            const t = String(m.text);
+        if (!mem) return [];
+        const q = String(query || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        if (q && typeof mem.recall === 'function') {
+          let vh = [];
+          try {
+            vh = typeof mem.vectorHits === 'function' ? (await mem.vectorHits(q)) || [] : [];
+          } catch (error) {}
+          for (const h of mem.recall(q, { limit, where: '自主生活', shown: false, vectorHits: vh }) || []) {
+            const m = h && h.it;
+            if (!m || !m.text || have.has(m.id)) continue;
+            have.add(m.id);
+            out.push(hintLine(m));
+          }
+        }
+        if (out.length < limit && typeof mem.recentEvents === 'function') {
+          for (const m of mem.recentEvents(72, 30, { self: true }) || []) {
+            if (out.length >= limit) break;
+            if (!m || !m.text || have.has(m.id)) continue;
             const tags = Array.isArray(m.tags) ? m.tags.join(' ') : '';
-            return /机器上|软猫|项目|还在|没弄完|做到/i.test(t) || /自主生活/.test(tags);
-          })
-          .sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))
-          .slice(0, limit)
-          .map((m) => '- ' + String(m.text).replace(/\s+/g, ' ').slice(0, 90));
-      } catch (error) {
-        return [];
-      }
+            if (!/自主生活|自己说过/.test(tags)) continue;
+            have.add(m.id);
+            out.push(hintLine(m));
+          }
+        }
+      } catch (error) {}
+      return out;
+    }
+
+    /** 一条记忆写给小脑看：[什么时候] 内容 */
+    function hintLine(m) {
+      const t = Number(m.saidAt || m.at) || 0;
+      const title = m.meta && m.meta.title ? clip(m.meta.title, 30) : '';
+      const body = m.kind === 'seen'
+        ? `看过《${title || clip(m.text, 30)}》${title && m.text && m.text !== m.meta.title ? '：' + m.text : ''}`
+        : (m.aboutName && m.source !== 'event' ? `[${m.aboutName}] ` : '') + m.text;
+      return '- ' + (t ? `[${whenLabel(t)}] ` : '') + String(body).replace(/\s+/g, ' ').slice(0, 110);
+    }
+    function whenLabel(t) {
+      const d = new Date(t);
+      const hm = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+      const day = ymd(t);
+      if (day === ymd(Date.now())) return '今天 ' + hm;
+      if (day === ymd(Date.now() - 86400_000)) return '昨天 ' + hm;
+      return `${d.getMonth() + 1}月${d.getDate()}日`;
     }
 
     /** 心情：取 mood 模块给的那句话（读不到就空着） */
@@ -1668,7 +1703,7 @@ export default {
         if (!ready.ok) return { note: `想玩手机，没玩成：${ready.message}`, extra: { ok: false } };
 
         // 记忆互通：把想得起来的几件事拼进任务，让她带着自己的过往去玩
-        const memHints = recallHints(4);
+        const memHints = await recallHints(4, String(d.detail || d.why || ''));
         const memLine = memHints.length ? `（你还记得：${memHints.slice(0, 2).join('；')}）` : '';
         const baseGoal = String(d.detail || d.why || '').trim();
 
@@ -1854,11 +1889,12 @@ export default {
       const mbti = currentMbti();
       const style = MBTI_STYLE[mbti] || MBTI_STYLE.INFP;
       const mood = moodLine();
-      const memHints = recallHints(6);
       const projStale = !!(s.project && s.project.name && (Number(s.project.times) || 0) >= PROJECT_STALE_TIMES);
       const chat = ownerChatLines(Date.now() - 24 * 3600_000, 12);
       const carries = y && Array.isArray(y.carries) ? y.carries.filter((x) => x.from !== 'promise') : [];
       const promised = a.items.filter((x) => x.from === 'promise' && x.state === 'todo');
+      // 想起相关的事：拿昨天的安排、没做完的、答应主人的、正在弄的去搜
+      const memHints = await recallHints(6, [y && y.theme, ...(y && Array.isArray(y.items) ? y.items.map((x) => x.what) : []), ...carries.map((x) => x.what), ...promised.map((x) => x.what), s.project && s.project.name].filter(Boolean).join(' '));
       const timers = (s.timers || []).filter((t) => !t.fired);
       const stateText = (x) => (x.state === 'done' ? '做了' : x.state === 'dropped' ? '划掉了' : '没做') + (x.note ? '：' + x.note : '');
       // 今天第一次醒是几点：补排（定计划失败过、手动 /plan）时她早就起来了，别再说「刚醒」「睡到现在才起」
@@ -2067,7 +2103,8 @@ export default {
         .slice(0, 4)
         .map(([k, v]) => `${k}（${Number(v.count) || 1}次）`);
       const mood = moodLine();
-      const memHints = recallHints(6);
+      // 想起相关的事：拿今天的安排、最近做过的、正在弄的去搜
+      const memHints = await recallHints(6, [...((s.agenda && s.agenda.items) || []).filter((x) => x.state !== 'dropped').map((x) => x.what), ...recentList.slice(0, 4).map((x) => x.note), s.project && s.project.name].filter(Boolean).join(' '));
       // 这一轮允不允许「只想不做」：今天想过太多次、或者上一次醒来就只是在想 —— 都不许再想
       const thinkUsed = Number(s.thinkToday) || 0;
       const lastWasDry = !!(s.done && s.done[0] && s.done[0].dry);
