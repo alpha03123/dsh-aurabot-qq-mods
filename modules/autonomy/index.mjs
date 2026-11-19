@@ -634,21 +634,33 @@ export default {
       try {
         const mem = api.use('memory');
         if (!mem) return [];
-        const q = String(query || '').replace(/\s+/g, ' ').trim().slice(0, 300);
-        if (q && typeof mem.recall === 'function') {
-          let vh = [];
-          try {
-            vh = typeof mem.vectorHits === 'function' ? (await mem.vectorHits(q)) || [] : [];
-          } catch (error) {}
+        // 按今天的每一件事分别去想，再轮流各取一两条：拼成一句去搜的话，安排里出现最多的话题会占满（11-19 六条全是蛋糕）
+        const parts = (Array.isArray(query) ? query : [query])
+          .map((x) => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 120))
+          .filter(Boolean)
+          .filter((x, i, a) => a.indexOf(x) === i)
+          .slice(0, 8);
+        if (parts.length && typeof mem.recall === 'function') {
+          const lists = [];
+          for (const q of parts) {
+            let vh = [];
+            try {
+              vh = typeof mem.vectorHits === 'function' ? (await mem.vectorHits(q)) || [] : [];
+            } catch (error) {}
+            lists.push(mem.recall(q, { limit: 3, where: '自主生活', shown: false, quiet: true, vectorHits: vh }) || []);
+          }
           let seenN = 0;
-          for (const h of mem.recall(q, { limit: limit * 3, where: '自主生活', shown: false, vectorHits: vh }) || []) {
-            if (out.length >= limit) break;
-            const m = h && h.it;
-            if (!m || !m.text || have.has(m.id)) continue;
-            if (m.kind === 'seen' && seenN >= 1) continue;
-            if (m.kind === 'seen') seenN++;
-            have.add(m.id);
-            out.push(hintLine(m));
+          for (let round = 0; round < 3 && out.length < limit; round++) {
+            for (const list of lists) {
+              if (out.length >= limit) break;
+              const h = list[round];
+              const m = h && h.it;
+              if (!m || !m.text || have.has(m.id)) continue;
+              if (m.kind === 'seen' && seenN >= 1) continue;
+              if (m.kind === 'seen') seenN++;
+              have.add(m.id);
+              out.push(hintLine(m));
+            }
           }
         }
         // 分层记忆补充：若记忆库开启了 L1 热记忆，优先确保最活跃的几条非 seen 记忆也能进小脑视野
@@ -1712,7 +1724,8 @@ export default {
       }
       try {
         const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') {
+        // /try 测试跑的不算她真看过：不写进记忆（11-19 测试时写进去 8 条，事后删掉）
+        if (mem && typeof mem.addEvent === 'function' && !(s && s.__trial)) {
           mem.addEvent({
             kind: 'seen',
             text: [saw, feeling].filter(Boolean).join('；'),
@@ -2074,7 +2087,7 @@ export default {
       const carries = y && Array.isArray(y.carries) ? y.carries.filter((x) => x.from !== 'promise') : [];
       const promised = a.items.filter((x) => x.from === 'promise' && x.state === 'todo');
       // 想起相关的事：拿昨天的安排、没做完的、答应主人的、正在弄的去搜
-      const memHints = await recallHints(6, [y && y.theme, ...(y && Array.isArray(y.items) ? y.items.map((x) => x.what) : []), ...carries.map((x) => x.what), ...promised.map((x) => x.what), s.project && s.project.name].filter(Boolean).join(' '));
+      const memHints = await recallHints(6, [y && y.theme, ...(y && Array.isArray(y.items) ? y.items.map((x) => x.what) : []), ...carries.map((x) => x.what), ...promised.map((x) => x.what), s.project && s.project.name].filter(Boolean));
       const timers = (s.timers || []).filter((t) => !t.fired);
       const stateText = (x) => (x.state === 'done' ? '做了' : x.state === 'dropped' ? '划掉了' : '没做') + (x.note ? '：' + x.note : '');
       // 今天第一次醒是几点：补排（定计划失败过、手动 /plan）时她早就起来了，别再说「刚醒」「睡到现在才起」
@@ -2298,7 +2311,7 @@ export default {
         .map(([k, v]) => `${k}（${Number(v.count) || 1}次）`);
       const mood = moodLine();
       // 想起相关的事：拿今天的安排、正在弄的去搜（最近做过的事上面已经列着，不拿来搜，免得搜回它自己）
-      const memHints = await recallHints(6, [...((s.agenda && s.agenda.items) || []).filter((x) => x.state !== 'dropped').map((x) => x.what), s.project && s.project.name].filter(Boolean).join(' '));
+      const memHints = await recallHints(6, [...((s.agenda && s.agenda.items) || []).filter((x) => x.state !== 'dropped').map((x) => x.what), s.project && s.project.name].filter(Boolean));
       // 这一轮允不允许「只想不做」：今天想过太多次、或者上一次醒来就只是在想 —— 都不许再想
       const thinkUsed = Number(s.thinkToday) || 0;
       const lastWasDry = !!(s.done && s.done[0] && s.done[0].dry);
@@ -2593,7 +2606,7 @@ export default {
         if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause };
       }
       s.done = [
-        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
+        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.why, 30), dry, kind: d.kind || '', why: String(d.why || '').slice(0, 60), ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
         ...(s.done || []),
       ].slice(0, 50);
       if (d.topic && d.action !== 'rest') s.topicLog = [{ at, topic: d.topic, action: d.action }, ...(s.topicLog || [])].slice(0, 60);
@@ -2919,7 +2932,31 @@ export default {
 
     // 方案 A：动态当前背景（时间、天气、刚才在干嘛、精力、出门）不再写入 api.context（会每分钟触发 DSH 重贴 1500 字快照），
     // 改为在 api.on('prompt') 里只贴在当轮消息前，让历史里的状态天然附着在对应时间点。
-    function buildTurnBackground(chat) {
+    /**
+     * 她今天做过的事，接进主人私聊的会话：每轮只追加「这个会话上次贴过之后」新做的，会话历史自然攒成当天的流水。
+     * 只记结果和一句为什么，不记决策过程（人也记不清自己当时怎么权衡的）。换了新会话（睡前整理后）从今天第一件重新贴。
+     */
+    const LIFE_SKIP = new Set(['idle', 'speak', 'timer']);
+    function lifeLogBlock(s, sessionId) {
+      const key = String(sessionId || '');
+      if (!key) return '';
+      const shown = (s.lifeShown && s.lifeShown[key]) || 0;
+      const rows = (s.done || [])
+        .filter((x) => x && Number(x.at) > shown && !x.dry && !LIFE_SKIP.has(x.action))
+        .sort((a, b) => a.at - b.at);
+      if (!rows.length) return '';
+      const MAX = 12;
+      const older = Math.max(0, rows.length - MAX);
+      const line = (x) => {
+        const what = x.action === 'rest' ? '歇了一会儿' : clip(x.note || x.brief || x.action, 70);
+        return `${clock(x.at)} ${what}${x.why && x.action !== 'rest' ? `（${clip(x.why, 24)}）` : ''}`;
+      };
+      s.lifeShown = Object.fromEntries([...Object.entries(s.lifeShown || {}).filter(([k]) => k !== key).slice(-4), [key, rows[rows.length - 1].at]]);
+      save(s);
+      return `【今天做过的事（接着上次跟他聊之后，这是你自己过的日子，聊到了可以自然提起，没聊到不用报备）】${older ? `（更早还有 ${older} 件）` : ''}${rows.slice(-MAX).map(line).join('；')}`;
+    }
+
+    function buildTurnBackground(chat, sessionId = '') {
       try {
         if (!cfg().enabled || !chat) return '';
         const nowStr = `${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}`;
@@ -2932,6 +2969,8 @@ export default {
         if (s.weather && s.weather.now) bg.push(`天气：${weatherLine(s.weather, { full: true })}`);
         bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
         const parts = [`【当前背景（仅作背景知晓，不必刻意提起或报备）】${bg.join('｜')}`];
+        const life = lifeLogBlock(s, sessionId);
+        if (life) parts.push(life);
         if (s.energy && isAwakeHour(cfg())) {
           const v = energyNow(s);
           if (v < 35) parts.push(`【精力】你${energyLabel(v)}，回话会懒一点、短一点（别句句喊困）。`);
@@ -3182,7 +3221,7 @@ export default {
       s.busy = { since: now, until: now + mins * 60_000, what: item.what, canPause: item.canPause != null ? item.canPause : null };
       addEnergy(s, item.energy != null ? item.energy : energyDelta(item.action || 'life'));
       if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
-      s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id }, ...(s.done || [])].slice(0, 50);
+      s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id, why: String(item.why || '').slice(0, 60) }, ...(s.done || [])].slice(0, 50);
       try {
         const mem = api.use('memory');
         if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: item.what, tags: ['自主生活', '生活'], importance: 0.3 });
@@ -3480,7 +3519,7 @@ export default {
         const chat = info.chat || {};
         if (!Array.isArray(content) || chat.kind === 'system') return undefined;
         const prefix = [];
-        const bg = buildTurnBackground(chat);
+        const bg = buildTurnBackground(chat, info.sessionId);
         if (bg) prefix.push({ type: 'text', text: bg });
         if (chat.kind === 'group' && groupWoken.has(chat.chatId)) {
           const at = groupWoken.get(chat.chatId);

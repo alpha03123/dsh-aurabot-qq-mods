@@ -205,6 +205,12 @@ export function slotPassed(slot, hour = new Date().getHours()) {
  */
 export function mergeOwnerEdits(mine, disk) {
   if (!disk || typeof disk !== 'object') return mine;
+  // 醒着这一轮期间，聊天那边可能刚把「今天做过的事」贴进会话：以盘上更新的为准，免得下一轮重复贴
+  if (disk.lifeShown && typeof disk.lifeShown === 'object') {
+    const merged = { ...(mine.lifeShown || {}) };
+    for (const [k, v] of Object.entries(disk.lifeShown)) merged[k] = Math.max(Number(merged[k]) || 0, Number(v) || 0);
+    mine.lifeShown = merged;
+  }
   const dt = Array.isArray(disk.timers) ? disk.timers : [];
   const mt = Array.isArray(mine.timers) ? mine.timers : [];
   for (const t of dt) {
