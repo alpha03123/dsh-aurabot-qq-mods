@@ -125,8 +125,9 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
     const why = clip(raw.why, 40);
     if (op === 'add') {
       const from = by === 'owner' ? 'promise' : raw.from === 'seen' ? 'seen' : 'self';
-      const r = addItem(agenda, { slot: raw.slot, what: raw.what, why, from, action: raw.action }, { hour, now });
-      if (r.ok) applied.push(`加了 ${r.item.id}「${r.item.what}」（${SLOT_LABEL[r.item.slot]}）`);
+      const at = clockToday(raw.time, now);
+      const r = addItem(agenda, { slot: at ? slotOf(new Date(at).getHours()) : raw.slot, what: raw.what, why, from, action: raw.action, at }, { hour, now });
+      if (r.ok) applied.push(`加了 ${r.item.id}「${r.item.what}」（${at ? fmtClock(at) : SLOT_LABEL[r.item.slot]}）`);
       else rejected.push(`没加「${clip(raw.what, 20)}」：${r.reason}`);
       continue;
     }
@@ -144,14 +145,17 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
       item.note = why || item.note;
       applied.push(`划掉 ${item.id}「${item.what}」${why ? '：' + why : ''}`);
     } else if (op === 'defer' && item.state === 'todo') {
-      const slot = normSlot(raw.slot, '');
-      if (!slot || slot === item.slot) {
-        rejected.push(`${item.id}：挪到哪个时段没说清`);
+      // 挪到几点（time）优先；只说时段就挪到那个时段开头（已经过了就不收）
+      const at = clockToday(raw.time, now) || slotStartToday(normSlot(raw.slot, ''), now);
+      if (!at || at <= now) {
+        rejected.push(`${item.id}：挪到几点没说清（写 time，比如 21:00）`);
         continue;
       }
-      item.slot = slot;
+      item.at = at;
+      item.slot = slotOf(new Date(at).getHours());
+      delete item.retryAt;
       item.note = why || item.note;
-      applied.push(`${item.id}「${item.what}」挪到${SLOT_LABEL[slot]}${why ? '：' + why : ''}`);
+      applied.push(`${item.id}「${item.what}」挪到 ${fmtClock(at)}${why ? '：' + why : ''}`);
     } else if (op === 'done' && item.state === 'todo') {
       item.state = 'done';
       item.note = why || item.note;
@@ -186,7 +190,7 @@ function itemLine(x, curSlot) {
   if (x.state === 'done') state = '做了' + (x.note ? '：' + x.note : '');
   else if (x.state === 'dropped') state = '划掉了' + (x.note ? '：' + x.note : '');
   else {
-    if (slotRank(x.slot) < slotRank(curSlot)) state = '时段过了还没做';
+    if (x.at ? x.at < Date.now() - 30 * 60_000 : slotRank(x.slot) < slotRank(curSlot)) state = '过了点还没做';
     else if (x.note) state = (Number(x.tries) > 0 ? '还没做成：' : '还没做（') + x.note + (Number(x.tries) > 0 ? '' : '）');
     // 为这条做过准备（查资料、看教程），但这件事本身还没做
     if (x.progress) state += `；为它做过：${x.progress}`;
@@ -436,4 +440,62 @@ export function energyDelta(action) {
   if (action === 'outing') return -5;
   if (['bili', 'web', 'phone', 'draw'].includes(action)) return -3;
   return 0;
+}
+
+// ── 按时间走的日程 ──────────────────────────────────────
+// 每条安排都有个开始时间（at）：到点了才叫决策层为这一条想一下。没写时间的（老数据、加进来的）按时段补一个。
+export const SLOT_START_MIN = { morning: 9 * 60 + 30, afternoon: 14 * 60, evening: 19 * 60, night: 22 * 60 };
+
+/** 「21:00」→ 今天这个点的时间戳；格式不对、或者已经过去 5 分钟以上 → 0 */
+export function clockToday(text, now = Date.now()) {
+  const m = String(text || '').trim().match(/^(\d{1,2})[:：](\d{2})$/);
+  if (!m) return 0;
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (!(h >= 0 && h < 24 && mi >= 0 && mi < 60)) return 0;
+  const d = new Date(now);
+  d.setHours(h, mi, 0, 0);
+  return d.getTime() < now - 5 * 60_000 ? 0 : d.getTime();
+}
+
+/** 某个时段今天的开头；已经过了返回 0 */
+export function slotStartToday(slot, now = Date.now()) {
+  if (!SLOT_START_MIN[slot]) return 0;
+  const d = new Date(now);
+  d.setHours(0, SLOT_START_MIN[slot], 0, 0);
+  return d.getTime() > now ? d.getTime() : 0;
+}
+
+/**
+ * 给还没做、又没写时间的条目补一个开始时间：按时段从开头（或现在）往后排，一条接一条（busyMin + 15 分钟间隔）。
+ * 时段已经过了的排到现在之后。返回补了几条。
+ */
+export function ensureTimes(agenda, { now = Date.now() } = {}) {
+  const todo = (agenda && agenda.items ? agenda.items : []).filter((x) => x.state === 'todo' && !x.at);
+  if (!todo.length) return 0;
+  const taken = agenda.items.filter((x) => x.at && x.state === 'todo').map((x) => [x.at, x.at + (Number(x.busyMin) || 30) * 60_000]);
+  const free = (t, mins) => !taken.some(([a, b]) => t < b && t + mins * 60_000 > a);
+  const cursor = {};
+  for (const x of todo.sort((a, b) => slotRank(a.slot) - slotRank(b.slot) || (a.addedAt || 0) - (b.addedAt || 0))) {
+    const mins = Number(x.busyMin) || 45;
+    let t = Math.max(cursor[x.slot] || slotStartToday(x.slot, now) || 0, now + 5 * 60_000);
+    for (let i = 0; i < 24 && !free(t, mins); i++) t += 20 * 60_000;
+    x.at = t;
+    taken.push([t, t + mins * 60_000]);
+    cursor[x.slot] = t + (mins + 15) * 60_000;
+  }
+  return todo.length;
+}
+
+/** 到点该想一下的那条（auto(x) 为 true 的是到点自己发生的生活小事，不在这里管）；没有返回 null */
+export function dueItem(agenda, now = Date.now(), auto = () => false) {
+  const due = (agenda && agenda.items ? agenda.items : [])
+    .filter((x) => x.state === 'todo' && x.at && x.at <= now && !(Number(x.retryAt) > now) && !auto(x))
+    .sort((a, b) => a.at - b.at);
+  return due[0] || null;
+}
+
+/** 下一条还没到点的（给状态显示和「下一条是什么」用） */
+export function nextItem(agenda, now = Date.now()) {
+  return (agenda && agenda.items ? agenda.items : []).filter((x) => x.state === 'todo' && x.at && x.at > now).sort((a, b) => a.at - b.at)[0] || null;
 }
