@@ -3842,6 +3842,20 @@ export default {
       return { ok: true, ...r, agenda: s.agenda };
     });
 
+    // 重新开始她的某个后台会话（写日记 / 排日程这类，会话一直沿用、会把以前的轮次带着走）：归档旧的，下一轮开新的。
+    // 只认自主生活自己的后台会话，比如 ?key=diary → system:ext-autonomy:diary
+    api.route('/sessions/reset', async (req) => {
+      const q = api.core && api.core.http && typeof api.core.http.query === 'function' ? api.core.http.query(req) : {};
+      const k = String((q && q.key) || '').replace(/[^\w-]/g, '').slice(0, 32);
+      if (!k) return { ok: false, message: '要带上 key（比如 diary、plan）' };
+      const h = hub();
+      if (!h || typeof h.resetChat !== 'function') return { ok: false, message: '宿主没有重置会话的能力' };
+      const chatId = `system:ext-autonomy:${k}`;
+      const done = h.resetChat(chatId);
+      api.log.info(`自主生活：后台会话 ${chatId} ${done ? '已归档，下一轮重新开始' : '本来就没有'}`);
+      return { ok: true, chatId, archived: !!done };
+    });
+
     api.route('/wake', async () => {
       if (waking) return { ok: false, message: '正在醒着呢，等这一轮跑完', state: snapshot() };
       waking = true;
