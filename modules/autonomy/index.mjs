@@ -2198,7 +2198,7 @@ export default {
         '- 这几件别都是一类：窝着看东西、上网查点什么、动手做点什么、出门走走、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
         `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话，平常天气只是背景也不算由头（真要下雨或明显降温提醒带伞添衣才算）。`,
         `- 不用把时间塞满。想留一段空闲就排一条 action 写「${FREE_ACTION}」（what 写「下午随便待着」这类），到点你再看那会儿想干嘛；心情不好可以少排，想偷懒也行。`,
-        '- 吃饭单独排、不占上面的名额（还没过的那几顿，按你自己的习惯）：action 起个名字比如「吃午饭」，what 写吃什么（像平常过日子，具体点，别太丰盛），time 写大概几点。到点就当你在吃，这段时间别人找你会晚点回。别的生活小事（午睡、洗澡、下厨）也这样：action 起个名字，到点就当你在做。',
+        '- 别忘了吃饭哦～还没过的那几顿顺手排上，不占上面的名额：action 起个名字比如「吃午饭」，what 写吃什么（像平常过日子，具体点，别太丰盛），time 写大概几点。到点就当你在吃，这段时间别人找你会晚点回。别的生活小事（午睡、洗澡、下厨）也这样：action 起个名字，到点就当你在做。',
         '',
         y && (y.items.length || y.done.length) ? '先用你自己的口气说一两句昨天过得怎么样，没做成的也照实说，然后排今天。' : '',
         '只输出 JSON：',
@@ -3199,7 +3199,10 @@ export default {
     async function bedtime(s, c) {
       const sleepAt = nextSleepAt(c) || Date.now() + 40 * 60_000;
       let note = '准备睡了';
-      if (isGranted(api.settings(), 'model') && diaryCount(ymd(Date.now())) < DIARY_MAX_PER_DAY) {
+      // 今天已经写过日记（比如日程里排了、提前写了）就不再写一篇
+      const wroteToday = diaryCount(ymd(Date.now())) > 0;
+      if (wroteToday) note = '今天的日记已经写过了，洗漱准备睡了';
+      if (isGranted(api.settings(), 'model') && !wroteToday) {
         try {
           const r = await writeLocalDiary({ detail: '睡前，回头想想今天' }, s);
           note = r.note;
