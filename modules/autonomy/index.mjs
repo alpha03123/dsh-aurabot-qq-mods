@@ -56,6 +56,15 @@ import {
   statusLine,
 } from './lib/agenda.mjs';
 import { PLACE_KINDS, pickKind, searchAmap, searchOsm, choosePlace, fmtDistance } from './lib/outing.mjs';
+
+/** 决策里填的地点类型：认 key（bookstore）也认中文名（书店），对不上就空串 */
+const placeKindOf = (v) => {
+  const t = String(v || '').trim();
+  if (!t) return '';
+  if (PLACE_KINDS[t]) return t;
+  const hit = Object.entries(PLACE_KINDS).find(([, k]) => k.label === t || t.includes(k.label));
+  return hit ? hit[0] : '';
+};
 import { SEARCH_BASE_URL, SEARCH_MODEL, buildSearchBody, parseSearchResponse, searchPageText } from './lib/websearch.mjs';
 
 import crypto from 'node:crypto';
@@ -428,6 +437,8 @@ export function parseDecision(out) {
     topic: String(j.topic || '').replace(/[\s「」『』"“”]/g, '').slice(0, 12),
     // web 用：拿去搜索引擎搜的关键词（不再拿 detail 那句话截断去搜）
     query: String(j.query || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+    // outing 用：去哪类地方（她从列表里选，代码不再从 detail 里按关键词猜）
+    place: placeKindOf(j.place),
     ops: Array.isArray(j.ops) ? j.ops.filter((o) => o && typeof o === 'object').slice(0, 3) : [],
     // 这件事本身：要忙多久、中途能不能放下、做完精力怎么变（她自己报，没写就是 null）
     ...selfReport(j),
@@ -1360,7 +1371,8 @@ export default {
       const nowMin = now.getHours() * 60 + now.getMinutes();
       const wish = clip(d.detail || d.why, 60);
       // 想去的那类找不到开着的，就换成同样下雨能去的另一类再试一次
-      let kind = pickKind(wish, { wet, hour: now.getHours() });
+      // 去哪类地方：她选的优先；没选（老输出、/try）才按 detail 猜
+      let kind = (d.place && PLACE_KINDS[d.place] ? d.place : '') || pickKind(wish, { wet, hour: now.getHours() });
       const visits = (readJson(outingFile(), () => ({ cache: {}, visits: {} })).visits) || {};
       const home = { lat: Number(c.homeLat), lon: Number(c.homeLon) };
       let place = null;
@@ -2392,15 +2404,15 @@ export default {
         cantDo(s, 'diary') ? '' : `- diary：写一篇只给自己看的日记（一天最多 ${DIARY_MAX_PER_DAY} 篇）——detail 写想写什么`,
         cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线，上面装了 B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机，按你自己的兴趣打开看看、随手记两句都行',
         cantDo(s, 'draw') ? '' : '- draw：给自己画一张图',
-        cantDo(s, 'outing') ? '' : `- outing：出门去附近真实存在的地方（${Object.values(PLACE_KINDS).map((k) => k.label).join('、')}）——detail 写想去哪类地方、去干嘛（「去菜场买点冬笋」「去公园走走」），会挑一家真的店；今天还能出门 ${Math.max(0, OUTING_MAX_PER_DAY - (Number((s.dayCounts || {}).outing) || 0))} 次`,
+        cantDo(s, 'outing') ? '' : `- outing：出门去附近真实存在的地方（${Object.values(PLACE_KINDS).map((k) => k.label).join('、')}）——place 从这几类里选一个，detail 写去干嘛（「去菜场买点冬笋」「去公园走走」），会在这类里挑一家真的店；今天还能出门 ${Math.max(0, OUTING_MAX_PER_DAY - (Number((s.dayCounts || {}).outing) || 0))} 次`,
         thinkAllowed ? '- think：认真想一件让你好奇的事（光想不做，一天别太多）' : '- think：（这一轮关掉了，别选）',
         '- rest：歇着——窝着、躺会儿、发会儿呆都算，下次晚点醒',
         `- 生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……自己起个短名字当 action，detail 写清楚做了什么（「楼下面馆吃了碗牛肉面」）。这些算你真的过了这一段，之后聊天能提起来。${cantDo(s, 'outing') ? '' : '要出门去具体的店、公园就用 outing，会挑附近真的地方。'}`,
         '',
         '只回一个 JSON：',
-        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
+        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","place":"","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
         'agendaDone：填了 agendaId 才看——这一轮做完，那条是不是就算做完了；只是为它查资料、看教程、做准备，写 false。',
-        'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：web 和 bili 才填——web 是拿去搜索引擎搜的关键词，bili 是 B 站搜索框里搜的词（随便刷就空着）。',
+        'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：web 和 bili 才填——web 是拿去搜索引擎搜的关键词，bili 是 B 站搜索框里搜的词（随便刷就空着）。place：只有 outing 才填，从上面 outing 那行列的几类地方里选一个。',
         'nextMinutes 是你想大概多久后再醒（分钟）：这件事要做很久就写长点，只是歇一下就写短点，不确定就写 0。',
         'busyMin / canPause / energy 说的是这件事本身，按你自己的情况填：busyMin 大概要占你多少分钟（不占手就 0）；canPause 这期间有人找你，能不能随手放下先回（true / false）；energy 做完精力大概怎么变（-10 到 +25 的整数，回血就正，累人就负）。',
         replansLeft > 0
@@ -2433,6 +2445,7 @@ export default {
       let blockedForRepeat = 0;
       let blockedForSoft = 0;
       // 最多问两次：模型偶尔返回空、只给半截 JSON（尤其和 QQ 会话并发时）
+      let modelErrors = 0; // 两次都是模型那边报错（多半是网络 / 代理没起来），不是她没想法
       for (let attempt = 0; attempt < 2 && !d; attempt += 1) {
         try {
           if (attempt > 0) await new Promise((r) => setTimeout(r, 4000));
@@ -2478,6 +2491,7 @@ export default {
           d = p;
         } catch (error) {
           api.log.warn(`自主生活：第 ${attempt + 1} 次决策失败 ${error.message}`);
+          modelErrors += 1;
         }
       }
       // 两次都没成：如果是「今天的事都做够了」就歇着（推迟下次醒），
@@ -2489,6 +2503,10 @@ export default {
         } else if (blockedForRepeat > 0) {
           d = { action: 'rest', why: '今天想做的事都做过了，先歇着', detail: '', steps: [], nextMinutes: 0 };
           api.log.info('自主生活：今天没有没做过的事可做，改成歇着（下次晚点醒）');
+        } else if (modelErrors >= 2) {
+          // 模型连不上：不算她发呆，10 分钟后再醒来想（别按作息表一睡两小时）
+          d = { action: 'idle', why: '模型连不上，过一会儿再想', detail: '', steps: [], nextMinutes: 0, retrySoon: true };
+          api.log.info('自主生活：两次决策都连不上模型，10 分钟后再试');
         } else {
           d = { action: 'idle', why: '这一轮没想出要做什么', detail: '', steps: [], nextMinutes: 0 };
           api.log.info('自主生活：两次都没拿到可用决策，改成发呆');
@@ -2554,6 +2572,7 @@ export default {
       // 出门了：回来之前别醒
       const awayMin = Number(result && result.extra && result.extra.busyMin) || 0;
       if (awayMin > 0) delay = Math.max(delay, awayMin + 3);
+      if (d.retrySoon) delay = 10;
       s.wakes += 1;
       s.thinkToday = (Number(s.thinkToday) || 0) + (dry ? 1 : 0);
       // 连续性：只统计真正连续做的当前活动；换去做别的事后立刻更新，避免旧项目卡一整天。
@@ -3781,7 +3800,7 @@ export default {
       const q = api.core && api.core.http && typeof api.core.http.query === 'function' ? api.core.http.query(req) : {};
       const action = String((q && q.action) || '').trim().slice(0, 16);
       if (!action) return { ok: false, message: '要给 action' };
-      const d = { action, detail: String((q && q.detail) || '').slice(0, 200), query: String((q && q.query) || '').slice(0, 40), why: '测试', steps: [], kind: '', nextMinutes: 0, agendaId: '', ops: [] };
+      const d = { action, detail: String((q && q.detail) || '').slice(0, 200), query: String((q && q.query) || '').slice(0, 40), place: placeKindOf(q && q.place), why: '测试', steps: [], kind: '', nextMinutes: 0, agendaId: '', ops: [] };
       const scratch = load();
       scratch.__trial = true; // 测试：出门不记「去过」
       waking = true;
