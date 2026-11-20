@@ -23,7 +23,7 @@ export const MAX_ITEMS = 14;
 /** 后台一天最多改几次表（有变动的那几轮才算） */
 export const REPLAN_MAX_PER_DAY = 8;
 /** 安排里的「找主人说话」一天最多几次；答应主人的不算 */
-export const SPEAK_MAX_PER_DAY = 3;
+export const SPEAK_MAX_PER_DAY = 5;
 /** 没做完的事最多拖几天：自己的事拖两天就算了，答应主人的多留一天 */
 const CARRY_MAX_AGE = { self: 2, seen: 2, promise: 3 };
 
