@@ -3154,6 +3154,16 @@ export default {
             return true;
           }
         }
+        // 3) 后台会话（排日程、写日记、刷 B 站、发弹幕……）：每一轮要用的事实提示词里都有，不靠会话历史；
+        //    一直沿用会把以前的轮次（包括写错的东西）一直带着、越攒越长。跨日就归档，第二天重新开始（关机错过的开机补上）
+        if (!waking && typeof h.resetChat === 'function') {
+          const stale = Object.entries(sessions).filter(([id, sess]) => id.startsWith('system:') && sess && ymd(Number(sess.createdAt) || now) < today);
+          if (stale.length) {
+            for (const [id] of stale) h.resetChat(id);
+            api.log.info(`自主生活：跨日归档了 ${stale.length} 个后台会话（${stale.map(([id]) => id.replace(/^system:/, '')).join('、')}）`);
+            return true;
+          }
+        }
       } finally {
         rollingOver = false;
       }
