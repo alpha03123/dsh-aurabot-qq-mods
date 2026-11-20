@@ -1849,10 +1849,19 @@ export default {
         if (b && typeof b.run === 'function') {
           const startAt = Date.now() - 5_000;
           const allowShare = canReachOwnerNow(s);
-          const r = await b.run({ force: true, allowShare });
+          const query = clip(d.query, 40);
+          const r = await b.run({ force: true, allowShare, query });
           if (r && Number(r.shared) + Number(r.shots || 0) > 0) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
           const seen = r && r.ok ? seenSince(startAt) : [];
           const base = (r && r.message) || '去 B 站看了看';
+          if (query) {
+            // 专门去找东西：找到了把要点写进结果（下一轮决策看得到）；没找到 / 没搜到如实记成没找到，不算做成，也不触发停用一天
+            const answers = (r && Array.isArray(r.answers) ? r.answers : []).slice(0, 3);
+            if (r && r.ok && answers.length) {
+              return { note: `${base}。找到的：${answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 120)}`).join('；')}`, extra: { ok: true } };
+            }
+            return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: false, later: true } };
+          }
           return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: !!(r && r.ok) } };
         }
         return { note: '想去 B 站，但那个模块没开着', extra: { ok: false } };
@@ -2378,7 +2387,7 @@ export default {
         brokenList.length ? `【这些最近老是做不成，今天先别选】${brokenList.join('、')}` : '',
         '下面是你现在能做的事：',
         `- speak：找${ownerName}说句话——detail 写具体想说什么（平常天气只是背景不算由头，真要下雨提醒带伞、明显降温提醒添衣才算）；安排里有对应的那条就填 agendaId`,
-        cantDo(s, 'bili') ? '' : '- bili：去 B 站看看，找点有趣的',
+        cantDo(s, 'bili') ? '' : '- bili：去 B 站看视频——随便刷刷就不填 query；想在 B 站找具体的东西（教程、某个梗、某首歌），query 写 B 站搜索框里搜的词（两三个词，比如「马克杯蛋糕 微波炉」），会只看搜到的视频（听里面说了什么、看画面和弹幕），没搜到会如实告诉你',
         cantDo(s, 'web') ? '' : `- web：自己上网查点东西——detail 写你想查什么（「最近有什么好看的冷门动画」「番茄炒蛋先放蛋还是先放番茄」），query 写拿去搜索引擎搜的几个关键词，会去搜一下、点开一条看${webBlockedText(s) ? `（最近打不开的网站：${webBlockedText(s)}）` : ''}`,
         cantDo(s, 'diary') ? '' : `- diary：写一篇只给自己看的日记（一天最多 ${DIARY_MAX_PER_DAY} 篇）——detail 写想写什么`,
         cantDo(s, 'phone') ? '' : '- phone：拿起手机玩——手机就在桌上连着线，上面装了 B站、知乎、QQ、高德、DeepSeek、笔记、相册、日历、相机，按你自己的兴趣打开看看、随手记两句都行',
@@ -2391,7 +2400,7 @@ export default {
         '只回一个 JSON：',
         '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","ops":[],"nextMinutes":45,"busyMin":30,"canPause":true,"energy":-2}',
         'agendaDone：填了 agendaId 才看——这一轮做完，那条是不是就算做完了；只是为它查资料、看教程、做准备，写 false。',
-        'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：只有 web 才填，拿去搜索引擎搜的几个关键词。',
+        'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：web 和 bili 才填——web 是拿去搜索引擎搜的关键词，bili 是 B 站搜索框里搜的词（随便刷就空着）。',
         'nextMinutes 是你想大概多久后再醒（分钟）：这件事要做很久就写长点，只是歇一下就写短点，不确定就写 0。',
         'busyMin / canPause / energy 说的是这件事本身，按你自己的情况填：busyMin 大概要占你多少分钟（不占手就 0）；canPause 这期间有人找你，能不能随手放下先回（true / false）；energy 做完精力大概怎么变（-10 到 +25 的整数，回血就正，累人就负）。',
         replansLeft > 0
