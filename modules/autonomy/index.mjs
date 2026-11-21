@@ -259,6 +259,21 @@ async function streamOnce(llm, params, waitMs, timeoutMs) {
 const ACTIONS = ['idle', 'speak', 'bili', 'web', 'diary', 'phone', 'draw', 'think', 'rest', 'outing'];
 /** 一天最多出门几次 */
 const OUTING_MAX_PER_DAY = 3;
+// 查到过的东西留多久、最多几条（state.findings）
+const FINDINGS_KEEP_MS = 7 * 86_400_000;
+const FINDINGS_MAX = 30;
+const FINDINGS_SHOWN = 6;
+/** 之前查到过的要点（事实）：最近的在前，给决策层 / 排日程看，免得以为一直没查到 */
+function findingsBlock(s) {
+  const list = (Array.isArray(s && s.findings) ? s.findings : []).filter((x) => x && x.text).slice(0, FINDINGS_SHOWN);
+  if (!list.length) return '';
+  const when = (t) => {
+    const d = new Date(t);
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return d.toDateString() === new Date().toDateString() ? `今天 ${hm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
+  };
+  return `【你之前查到过的】（B 站 / 上网真找到的要点）\n${list.map((x) => `- ${when(x.at)}${x.topic ? `〔${x.topic}〕` : ''}${x.query ? `搜「${x.query}」` : ''}：${String(x.text).slice(0, 260)}`).join('\n')}`;
+}
 /** 有专用执行器的动作；不在这里的动作发布版只记录、不执行 */
 const STANDARD_ACTIONS = new Set(ACTIONS);
 // 日程里「空着」的那段：到点让她自己决定这段时间干嘛
@@ -739,6 +754,12 @@ export default {
       const keepTimers = (Array.isArray(s.timers) ? s.timers : []).filter((t) => t && !t.fired && t.at > Date.now() - 86_400_000);
       // 最近 24 小时每轮的话题（跨天保留，done 每天清空数不到昨天）、最近 7 天打不开的网站
       const keepTopics = (Array.isArray(s.topicLog) ? s.topicLog : []).filter((x) => x && x.topic && x.at > Date.now() - 86_400_000).slice(0, 60);
+      // 查到过的东西（B 站 / 上网找到的要点）：留 7 天，下次想再查同一件事时先看得到自己已经查到过什么
+      // 第一次用（还没有 findings）：从活动流水里把最近 7 天 B 站搜到的要点补上
+      const seedFindings = () => readLog(300)
+        .filter((r) => r && r.action === 'bili' && r.at > Date.now() - FINDINGS_KEEP_MS && /找到的：/.test(String(r.note || '')))
+        .map((r) => ({ at: r.at, topic: clip(r.topic || '', 20), query: clip((String(r.note).match(/搜「([^」]+)」/) || [])[1] || '', 40), text: String(r.note).split('找到的：').slice(1).join('找到的：').slice(0, 700) }));
+      const keepFindings = (Array.isArray(s.findings) ? s.findings : seedFindings()).filter((x) => x && x.text && x.at > Date.now() - FINDINGS_KEEP_MS).slice(0, FINDINGS_MAX);
       const keepBlocked = Object.fromEntries(Object.entries(s.webBlocked && typeof s.webBlocked === 'object' ? s.webBlocked : {}).filter(([, v]) => v && v.at > Date.now() - 7 * 86_400_000));
       if (s.day !== dayKey()) {
         // 昨天留个底，早上定计划时复盘用；答应主人还没做的直接带过来
@@ -770,6 +791,7 @@ export default {
       s.agenda = normalizeAgenda(s.agenda, dayKey());
       s.timers = keepTimers;
       s.topicLog = keepTopics;
+      s.findings = keepFindings;
       s.webBlocked = keepBlocked;
       if (!s.fails || typeof s.fails !== 'object') s.fails = { streak: {}, until: {} };
       s.fails.streak = s.fails.streak || {};
@@ -1796,7 +1818,7 @@ export default {
         api.log.info(`自主生活：上网的图 —— ${imageNote}`);
       }
       const note = `上网查「${topic}」：${saw}${feeling ? '（' + feeling + '）' : ''}${share ? `；想跟他聊：${share}` : ''}${imageNote ? '；' + imageNote : ''}`;
-      return { note, extra: { ok: true, output: link } };
+      return { note, extra: { ok: true, output: link, finding: { query: topic, text: saw } } };
     }
 
     // ── 日记：只记在本地（modules-data/autonomy/diary/日期.md），不发空间 ─────────
@@ -1907,7 +1929,10 @@ export default {
             // 专门去找东西：找到了把要点写进结果（下一轮决策看得到）；没找到 / 没搜到如实记成没找到，不算做成，也不触发停用一天
             const answers = (r && Array.isArray(r.answers) ? r.answers : []).slice(0, 3);
             if (r && r.ok && answers.length) {
-              return { note: `${base}。找到的：${answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 120)}`).join('；')}`, extra: { ok: true } };
+              return {
+                note: `${base}。找到的：${answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 120)}`).join('；')}`,
+                extra: { ok: true, finding: { query, text: answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 220)}`).join('；') } },
+              };
             }
             return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: false, later: true } };
           }
@@ -2052,7 +2077,6 @@ export default {
       const lines = [
         `你现在是 ${mbti} 的性子：${style.feel}。`,
         `说话的样子：${style.tone}。`,
-        `顺着这个性子，你现在更可能想做的事是 ${style.fav.join(' / ')}——但选别的也行，别有压力。`,
       ];
       if (p === 'high') lines.push('今天可以更皮一点：抬个杠、吐槽一句、偷偷搞点小动作、故意留点古怪的痕迹，都行，不用总是乖。');
       else if (p === 'low') lines.push('今天安静些，话少，动作也少，多歇着。');
@@ -2175,6 +2199,7 @@ export default {
         })(),
         ...(y ? y.items.map((x) => `- ${SLOT_LABEL[x.slot] || ''} · ${x.what} —— ${stateText(x)}`) : []),
         y && y.done.length ? `昨天实际做过（最近几件）：${y.done.slice(0, 6).map((x) => `${clock(x.at)} ${x.note || x.action}`).join('；')}` : '',
+        findingsBlock(s),
         carries.length ? `昨天没做完的：${carries.map((x) => x.what).join('、')}。还想做就写进今天，不想做就算了。这些是昨天写的，里面的「明天」「今晚」指的是昨天说的时候，搬到今天要换成今天的说法；跟天气有关的先对一下下面的天气，已经不成立的就别搬。` : '',
         promised.length ? `答应${owner}的事已经排上了，不用再写：${promised.map((x) => `${SLOT_LABEL[x.slot]} ${x.what}`).join('、')}` : '',
         timers.length ? `定了时间的：${timers.map((t) => `${clock(t.at)} ${t.what}`).join('、')}（到点会叫你）` : '',
@@ -2196,6 +2221,7 @@ export default {
         '怎么排：',
         `- 吃饭另算（见下面），除此之外排 4~6 件你自己的事。每件都写大概几点开始（time）、要多久（busyMin）。现在是 ${clock()}，已经过去的时间别排；起得晚、剩下的时间少，就按比例少排。到了那个点系统会叫你，到时候还可以改主意。`,
         '- 这几件别都是一类：窝着看东西、上网查点什么、动手做点什么、出门走走、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
+        '- 查东西和动手做是两件事，分开排：查（bili / web）是一条，查完这条就算做完；真动手做（下厨、缝补、拼东西这类）是另一条生活里的事，action 自己起名字，到点就当你在做。',
         `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话，平常天气只是背景也不算由头（真要下雨或明显降温提醒带伞添衣才算）。`,
         `- 不用把时间塞满。想留一段空闲就排一条 action 写「${FREE_ACTION}」（what 写「下午随便待着」这类），到点你再看那会儿想干嘛；心情不好可以少排，想偷懒也行。`,
         '- 别忘了吃饭哦～还没过的那几顿顺手排上，不占上面的名额：action 起个名字比如「吃午饭」，what 写吃什么（像平常过日子，具体点，别太丰盛），time 写大概几点。到点就当你在吃，这段时间别人找你会晚点回。别的生活小事（午睡、洗澡、下厨）也这样：action 起个名字，到点就当你在做。',
@@ -2417,6 +2443,7 @@ export default {
         '',
         recent.length ? `${recent3h.length ? '最近 3 小时做过' : '你最近做过'}：\n${recent.join('\n')}` : '你今天还没做过什么。',
         topicFacts.length ? `最近 24 小时花在同一件事上的轮数：${topicFacts.join('；')}。` : '',
+        findingsBlock(s),
         usedUp.length ? `【今天已经做够的】${usedUp.join('、')}——今天一次都不许再做了，换一件没做过的。` : '',
         invented.length ? `你自己发明过的活动：${invented.join('、')}——可以接着做，也可以发明新的。` : '',
         memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
@@ -2479,7 +2506,8 @@ export default {
         cfg: api.config(),
         maxTokens: 1600,
         temperature: 0.9,
-        reasoningEffort: 'low',
+        // 2026-11-21 回放今早的真实提示词：low 时 8/10 又去搜同一件事（蛋糕循环），medium 时 9/10 照安排去做；多几百个思考 token
+        reasoningEffort: 'medium',
         // 模型卡住时最多等这么久，超了就放弃这一轮（按 settings.askTimeoutSec，默认 45 秒）
         timeoutMs: Math.max(1, Number(c.askTimeoutSec) || 45) * 1000,
       };
@@ -2593,7 +2621,7 @@ export default {
           item.tries = (Number(item.tries) || 0) + 1;
         } else if (d.agendaDone === false) {
           // 只是为这条做了准备（查配方、看教程）：记下做过什么，这条本身还没做
-          item.progress = clip(result.note, 50);
+          item.progress = clip(result.note, 160);
         } else {
           item.state = 'done';
           item.note = clip(result.note, 60);
@@ -2684,6 +2712,10 @@ export default {
         ...(s.done || []),
       ].slice(0, 50);
       if (d.topic && d.action !== 'rest') s.topicLog = [{ at, topic: d.topic, action: d.action }, ...(s.topicLog || [])].slice(0, 60);
+      if (result.extra && result.extra.finding && result.extra.finding.text && !s.__trial) {
+        const f = result.extra.finding;
+        s.findings = [{ at, topic: clip(d.topic || f.query, 20), query: clip(f.query, 40), text: String(f.text).slice(0, 700) }, ...(s.findings || [])].slice(0, FINDINGS_MAX);
+      }
       // 空想和歇着都不覆盖「留给自己的话」——否则那句话会在下次提示词里自己喂自己
       if (!dry && !resting) s.note = d.why || '';
       // 不再定时醒：下次是日程上的下一条（只给状态显示用；没排日程时它管什么时候排）
