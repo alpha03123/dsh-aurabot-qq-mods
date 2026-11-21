@@ -3466,6 +3466,9 @@ export default {
       return null;
     }
 
+    // 排今天的日程用 high：一天只排一次，定了一整天怎么过（2026-11-21 回放：比 low 每天多排点不同的事；成本是每天一次调用）
+    api.on('model', (sel, chat) => (sel && chat && chat.chatId === 'system:ext-autonomy:plan' ? { ...sel, reasoningEffort: 'high' } : undefined));
+
     api.on('reply/hold', async (ms, info) => {
       try {
         const c = cfg();
