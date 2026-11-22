@@ -1908,7 +1908,8 @@ export default {
       if (d.action === 'speak') {
         // 带着具体话题去开口：安排里那条的内容优先，其次是这轮决策写的 detail
         const item = d.agendaId ? s.agenda.items.find((x) => x.id === d.agendaId) : null;
-        const what = (item && item.what) || d.detail || d.why;
+        // 决策层这一轮写的 detail 优先（刚想好的具体说法），没有再用安排里那条的标题
+        const what = d.detail || (item && item.what) || d.why;
         // 没具体话题就不找：主动找主人只走 autonomy 自己这一条路
         if (!what) return { note: '想找你说话，但没想好说什么，就算了', extra: { ok: false } };
         const r = await reachOwner(s, { what, why: item ? item.why : '', promise: !!(item && item.from === 'promise') });
@@ -2506,8 +2507,8 @@ export default {
         cfg: api.config(),
         maxTokens: 1600,
         temperature: 0.9,
-        // 2026-11-21 回放今早的真实提示词：low 时 8/10 又去搜同一件事（蛋糕循环），medium 时 9/10 照安排去做；多几百个思考 token
-        reasoningEffort: 'medium',
+        // 2026-11-21 回放：low 时 8/10 又去搜同一件事（蛋糕循环）。deepseek-flash 没有 medium 档，之前写 medium 实际一直按 high 跑；直接写明 high
+        reasoningEffort: 'high',
         // 模型卡住时最多等这么久，超了就放弃这一轮（按 settings.askTimeoutSec，默认 45 秒）
         timeoutMs: Math.max(1, Number(c.askTimeoutSec) || 45) * 1000,
       };
@@ -2664,7 +2665,8 @@ export default {
         }
       }
       // 生活里的事写进记忆（做过的事），聊天时她能想起来「刚吃了碗面」；节流 15 分钟
-      if (result.extra && result.extra.life && Date.now() - (Number(s.lastLifeMemoAt) || 0) > 15 * 60_000) {
+      // 出门例外：回来时 finishOuting 写一条「去了X：…」，出发这一刻不再另记一条
+      if (result.extra && result.extra.life && !result.extra.outing && Date.now() - (Number(s.lastLifeMemoAt) || 0) > 15 * 60_000) {
         try {
           const mem = api.use('memory');
           if (mem && typeof mem.addEvent === 'function') {
