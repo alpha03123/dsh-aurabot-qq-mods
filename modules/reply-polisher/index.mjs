@@ -186,13 +186,11 @@ export default {
       try {
         const hub = api.core?.hub;
         if (hub && typeof hub.chatLogOf === 'function') {
-          let entries = (hub.chatLogOf(localDay(0)) || []).filter(
-            (e) => e && e.chatId === chatId && e.who !== 'bot' && e.who !== '系统' && e.text
-          );
+          const cutoff = Date.now() - 30 * 60 * 1000;
+          const keep = (e) => e && e.chatId === chatId && e.who !== 'bot' && e.who !== '系统' && e.text && (!e.t || Number(e.t) >= cutoff);
+          let entries = (hub.chatLogOf(localDay(0)) || []).filter(keep);
           if (entries.length < maxTake) {
-            const prev = (hub.chatLogOf(localDay(-1)) || []).filter(
-              (e) => e && e.chatId === chatId && e.who !== 'bot' && e.who !== '系统' && e.text
-            );
+            const prev = (hub.chatLogOf(localDay(-1)) || []).filter(keep);
             entries = [...prev, ...entries];
           }
           for (const e of entries.slice(-maxTake)) {
@@ -219,7 +217,7 @@ export default {
         }
       }
 
-      return lines.length ? lines.join('\n') : '用户：（主动搭话）';
+      return lines.length ? lines.join('\n') : '（无）';
     }
 
     async function polish({ chatId, draft, userText = '', history = '' }) {
