@@ -1,0 +1,13 @@
+{
+  "id": "reply-polisher",
+  "name": "回复润色器（Ollama）",
+  "version": "0.1.0-local",
+  "description": "把主模型产出的聊天草稿交给本机 Ollama 润色模型（如 aurabot-v5-ep2），去 AI 味、套人设语气、拆多气泡并保留协议标签与数字事实。",
+  "category": "chat",
+  "author": "local",
+  "license": "MIT",
+  "api": 1,
+  "minPluginVersion": "1.2.0",
+  "requires": [],
+  "capabilities": []
+}
