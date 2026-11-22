@@ -62,7 +62,6 @@ import {
 import { searchAmap, searchOsm, candidatesFor, candidateLine, fmtDistance } from './lib/outing.mjs';
 import { SEARCH_BASE_URL, SEARCH_MODEL, buildSearchBody, parseSearchResponse, searchPageText } from './lib/websearch.mjs';
 
-import crypto from 'node:crypto';
 
 // ── 自带最小实现 ────────────────────────────────────────────────
 // 扩展模块拿不到插件内部源码：modules.js 的 rewriteImports 只处理插件 src 下的文件，
@@ -110,150 +109,19 @@ function writeJson(file, data) {
 /** 决策调用的默认超时：模型卡住时不能把整轮醒着的时间耗掉 */
 const ASK_TIMEOUT_MS = 45_000;
 
-/** 小脑留底（核心 core/trace.js）：setup 时接上；拿不到就不记，不影响调用 */
-let traceLib = null;
-/** 核心的模型工具（core/llm.js）：用它把思考强度收敛成模型真正支持的档位 */
+/** 核心的模型工具（core/llm.js）：后台决策都走它的 askModel */
 let coreLlm = null;
 
-const isUnsupportedEffort = (error) => /UNSUPPORTED_REASONING_EFFORT|does not support reasoning effort|reasoning effort/i.test(String((error && (error.message || error.code)) || ''));
-
-/** 问一次宿主模型（不进会话）：后台决策用。超时抛错，由上层降级处理。
- *  和核心 askModel 一样：思考强度默认 low（模型不支持就不传）；推理模型可能把输出预算全花在思考上、
- *  一个字没写，这时放宽预算再试一次（总时长仍受 timeoutMs 约束）。每次尝试都写小脑留底（key = 用途）。 */
+/** 问一次宿主模型（不进会话）：后台决策用。走核心的 askModel（选模型、思考档位、预算放宽重试、超时、小脑留底都在那里），
+ *  这里只多一条自己的约定：空返回要显式报错，否则会被当成「她没想好」，看起来像发呆。超时抛错，由上层降级处理。 */
 async function ask(dsh, { system, text, maxTokens = 260, temperature = 0.9, timeoutMs = ASK_TIMEOUT_MS, cfg = null, key = '', reasoningEffort = 'low' }) {
-  const llm = dsh.llm || (typeof dsh.get === 'function' ? dsh.get('llm') : null);
-  if (!llm || typeof llm.stream !== 'function') throw new Error('宿主没有 llm 服务');
-  // 本地改（2026-11-17）：先用 Aurabot 里选的模型（和聊天同一个），没选才用 DSH 的默认模型
-  let provider = cfg && cfg.model && cfg.model.provider ? cfg.model.provider : undefined;
-  let model = cfg && cfg.model && cfg.model.model ? cfg.model.model : undefined;
-  if (!provider || !model) try {
-    const svc = typeof dsh.get === 'function' ? dsh.get('agentDefaultModel') : null;
-    const sel = svc && typeof svc.currentSelection === 'function' ? svc.currentSelection() : null;
-    if (sel && sel.provider && sel.model) {
-      provider = sel.provider;
-      model = sel.model;
-    }
-  } catch (error) {}
-  if (!provider || !model) throw new Error('拿不到默认模型');
-  const messages = [
-    {
-      role: 'user',
-      id: crypto.randomUUID(),
-      content: [{ type: 'text', text }],
-      source: { kind: 'plugin', plugin: 'aurabot' },
-    },
-  ];
-  const t0 = Date.now();
-  const deadline = t0 + timeoutMs;
-  let caller = '';
-  try { caller = traceLib && typeof traceLib.callerOf === 'function' ? traceLib.callerOf() : ''; } catch (error) {}
-  let effort;
-  try {
-    effort = coreLlm && typeof coreLlm.pickReasoningEffort === 'function' ? await coreLlm.pickReasoningEffort(dsh, provider, model, reasoningEffort) : undefined;
-  } catch (error) {
-    effort = undefined;
+  if (!coreLlm || typeof coreLlm.askModel !== 'function') throw new Error('拿不到核心的模型工具（core/llm.js）');
+  const out = await coreLlm.askModel(dsh, { system, text, maxTokens, temperature, timeoutMs, cfg, key, reasoningEffort, source: 'autonomy' });
+  if (!out) {
+    const info = typeof coreLlm.lastEmptyInfo === 'function' ? coreLlm.lastEmptyInfo() : '';
+    throw new Error(`模型返回空（${info || '放宽预算重试后仍为空'}）`);
   }
-  const attempts = [];
-  let budget = maxTokens;
-  let widened = false;
-  let result = '';
-  let failed = '';
-  try {
-    for (let attempt = 0; ; attempt++) {
-      const left = deadline - Date.now();
-      if (left <= 0) throw new Error('模型调用超时（' + Math.round(timeoutMs / 1000) + ' 秒）');
-      let one;
-      try {
-        one = await streamOnce(llm, { provider, model, system, messages, maxTokens: budget, temperature, ...(effort ? { reasoningEffort: effort } : {}) }, left, timeoutMs);
-      } catch (error) {
-        if (error && error.attempt) attempts.push(error.attempt);
-        // 模型不认这个思考强度：去掉再来一次
-        if (attempt === 0 && effort && isUnsupportedEffort(error)) {
-          effort = undefined;
-          continue;
-        }
-        throw error;
-      }
-      attempts.push(one);
-      result = one.output.trim();
-      if (result || widened) break;
-      widened = true;
-      budget = Math.max(budget, Math.min(4000, budget * 3));
-    }
-    // 空返回要显式报错，否则会被当成「她没想好」，看起来像发呆
-    if (!result) {
-      const last = attempts[attempts.length - 1] || {};
-      throw new Error(`模型返回空（结束原因 ${last.finish || '无'}，放宽预算重试后仍为空）`);
-    }
-    return result;
-  } catch (error) {
-    failed = String((error && error.message) || error);
-    throw error;
-  } finally {
-    try {
-      if (traceLib && typeof traceLib.writeTrace === 'function') {
-        const last = attempts[attempts.length - 1] || {};
-        traceLib.writeTrace({
-          kind: 'ask',
-          source: 'autonomy',
-          key,
-          caller,
-          provider,
-          model,
-          maxTokens,
-          temperature,
-          timeoutMs,
-          reasoningEffortRequested: reasoningEffort ?? null,
-          reasoningEffortSent: last.reasoningEffort || null,
-          system,
-          input: text,
-          output: result,
-          reasoning: last.reasoning || '',
-          finish: last.finish || '',
-          usage: last.usage || null,
-          ms: Date.now() - t0,
-          error: failed,
-          attempts: attempts.length > 1 ? attempts : attempts.map(({ reasoning, output, ...rest }) => rest),
-        });
-      }
-    } catch (error) {}
-  }
-}
-
-/** 跑一次流式调用，最多等 waitMs：超时**真的取消底层请求**（只放计时器不 abort，流会一直挂在后台，
- *  模型服务卡死时整轮「醒着」结束不了，排程也跟着停摆）。返回这次尝试的明细；出错时明细挂在 error.attempt 上。 */
-async function streamOnce(llm, params, waitMs, timeoutMs) {
-  const rec = { maxTokens: params.maxTokens, reasoningEffort: params.reasoningEffort || null, ms: 0, finish: '', usage: null, types: {}, reasoning: '', output: '' };
-  const t0 = Date.now();
-  const ac = new AbortController();
-  const timer = setTimeout(() => {
-    ac.abort(new Error('模型调用超时（' + Math.round(timeoutMs / 1000) + ' 秒）'));
-  }, waitMs);
-  if (typeof timer.unref === 'function') timer.unref();
-  try {
-    for await (const chunk of llm.stream({ ...params, signal: ac.signal })) {
-      if (!chunk) continue;
-      rec.types[chunk.type] = (rec.types[chunk.type] || 0) + 1;
-      if (chunk.type === 'text-delta') rec.output += chunk.text;
-      if (chunk.type === 'reasoning-delta' && typeof chunk.text === 'string') rec.reasoning += chunk.text;
-      if (chunk.type === 'usage') rec.usage = chunk.usage || null;
-      if (chunk.type === 'finish') rec.finish = JSON.stringify(chunk.reason || {}).slice(0, 120);
-      if (chunk.type === 'finish' && chunk.reason && chunk.reason.kind === 'error') {
-        const f = chunk.reason.failure || {};
-        throw new Error('模型报错：' + (f.message || f.code || '未知'));
-      }
-    }
-    rec.ms = Date.now() - t0;
-    return rec;
-  } catch (error) {
-    rec.ms = Date.now() - t0;
-    // abort 抛出来的名字五花八门（AbortError / 自定义 reason），统一成一句人话
-    const e = ac.signal.aborted ? new Error('模型调用超时（' + Math.round(timeoutMs / 1000) + ' 秒）') : error;
-    try { e.attempt = rec; } catch (x) {}
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
+  return out;
 }
 
 const ACTIONS = ['idle', 'speak', 'bili', 'web', 'diary', 'phone', 'draw', 'think', 'rest', 'outing'];
@@ -626,7 +494,6 @@ export default {
   ],
 
   setup(api) {
-    try { traceLib = api.lib('core/trace.js'); } catch (error) { traceLib = null; }
     try { coreLlm = api.lib('core/llm.js'); } catch (error) { coreLlm = null; }
     const dshHome = path.resolve(api.dataDir(), '..', '..', '..', '..');
 
@@ -2218,6 +2085,7 @@ export default {
         '',
         '今天能做的事：',
         ...availableActions(owner, s).map((x) => '- ' + x),
+        personaLimits() ? `你做不到的事（排的时候别排进去）：\n${personaLimits()}` : '',
         '',
         '怎么排：',
         `- 吃饭另算（见下面），除此之外排 4~6 件你自己的事。每件都写大概几点开始（time）、要多久（busyMin）。现在是 ${clock()}，已经过去的时间别排；起得晚、剩下的时间少，就按比例少排。到了那个点系统会叫你，到时候还可以改主意。`,
@@ -2480,6 +2348,7 @@ export default {
         thinkAllowed ? '- think：认真想一件让你好奇的事（光想不做，一天别太多）' : '- think：（这一轮关掉了，别选）',
         '- rest：歇着——窝着、躺会儿、发会儿呆都算',
         `- 生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……自己起个短名字当 action，detail 写清楚做了什么（「楼下面馆吃了碗牛肉面」）。这些算你真的过了这一段，之后聊天能提起来。${cantDo(s, 'outing') ? '' : '要出门去具体的店、公园就用 outing，会挑附近真的地方。'}`,
+        personaLimits() ? `你做不到的事（安排里写了也做不成，换个做法或者划掉）：\n${personaLimits()}` : '',
         '',
         '只回一个 JSON：',
         '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","place":"","ops":[],"busyMin":30,"canPause":true,"energy":-2}',
@@ -3472,6 +3341,19 @@ export default {
         return { name, brief: clip((fm ? raw.slice(fm[0].length) : raw).replace(/\s+/g, ' ').trim(), 500) };
       } catch (error) {
         return { name: '', brief: '' };
+      }
+    }
+    /** 人设卡里【做不到的事】那一节（语言层看的是整张卡；排日程、决策只拿这一节，规则只写在人设卡一处） */
+    function personaLimits() {
+      try {
+        const c = readJson(configFile, {});
+        const id = (c && c.persona && c.persona.current) || '';
+        if (!id) return '';
+        const raw = fs.readFileSync(path.join(aurabotDir, 'personas', id + '.md'), 'utf8');
+        const m = raw.match(/【做不到的事】[^\n]*\n([\s\S]*?)(?=\n【|$)/);
+        return m ? clip(m[1].trim(), 400) : '';
+      } catch (error) {
+        return '';
       }
     }
     async function askJudge(texts, ctx) {

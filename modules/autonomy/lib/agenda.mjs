@@ -79,18 +79,18 @@ export function normalizeAgenda(raw, date) {
   return a;
 }
 
-const live = (a) => a.items.filter((x) => x.state !== 'dropped');
 
 /**
  * 加一条。返回 { ok, item?, reason? }。
- * 和已有的（没划掉的）太像就不加：后台最常见的毛病就是同一件事换个说法再塞一遍。
+ * 和还没做的那几条太像就不加：后台最常见的毛病就是同一件待办换个说法再塞一遍。
+ * 已经做完的不拦：今天做过的事想再来一次（蛋糕塌了再试一回）是她自己的决定。
  */
 export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0, busyMin = null, canPause = null, energy = null } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
   const w = clip(what, 40);
   if (!w) return { ok: false, reason: '没写要做什么' };
   if (agenda.items.length >= MAX_ITEMS) return { ok: false, reason: `今天已经排了 ${MAX_ITEMS} 条，别再加了` };
-  const dup = live(agenda).find((x) => similarText(x.what, w) >= SAME_ITEM_SIM);
-  if (dup) return { ok: false, reason: `和 ${dup.id}「${dup.what}」是一件事` };
+  const dup = agenda.items.find((x) => x.state === 'todo' && similarText(x.what, w) >= SAME_ITEM_SIM);
+  if (dup) return { ok: false, reason: `和还没做的 ${dup.id}「${dup.what}」是一件事（想改时间就用 defer）` };
   const item = {
     id: 'a' + agenda.nextId,
     slot: normSlot(slot, slotOf(hour)),
