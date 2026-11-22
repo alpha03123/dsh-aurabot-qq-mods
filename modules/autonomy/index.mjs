@@ -2595,9 +2595,9 @@ export default {
         if (r.applied.length) s.agenda.replans = (Number(s.agenda.replans) || 0) + 1;
         if (r.applied.length || r.rejected.length) api.log.info(`自主生活：改安排 ${[...r.applied, ...r.rejected.map((x) => '✗ ' + x)].join('；')}`);
       }
-      // 她说这轮在做安排里的哪一条：动作对得上才认（那条写的是 speak，这轮去刷 B 站，不算做了那条）
+      // 她说这轮在做安排里的哪一条，就认哪一条；做没做完听她的 agendaDone，不再拿动作类型去对
       const item = d.agendaId
-        ? s.agenda.items.find((x) => x.id === d.agendaId && x.state === 'todo' && (!x.action || !STANDARD_ACTIONS.has(x.action) || x.action === d.action)) || null
+        ? s.agenda.items.find((x) => x.id === d.agendaId && x.state === 'todo') || null
         : focus && !isFree && focus.action === d.action ? focus : null;
 
       let result = { note: '', extra: {} };
@@ -2615,7 +2615,7 @@ export default {
         if (!okDone && !(result.extra && result.extra.later) && d.action !== 'speak') moodNudge(-2, `想${clip(d.detail || d.action, 12)}没做成`);
       }
       // 安排里那条：做成了就勾掉；没做成留着，记一下卡在哪
-      if (item && !['think', 'rest', 'idle'].includes(d.action)) {
+      if (item) {
         if (result.extra && result.extra.ok === false) {
           item.note = clip(result.note, 40);
           item.tries = (Number(item.tries) || 0) + 1;
@@ -2768,6 +2768,17 @@ export default {
         ensureEnergy(s, c);
         const wChanged = await refreshWeather(s);
         if (wChanged || (!hadEnergy && s.energy)) save(s);
+      }
+      // 生活小事忙完了：补一句做得怎么样（先于下一件到点的事）
+      try {
+        waking = true;
+        try {
+          if (await tickLifeRecaps(s, c)) save(s);
+        } finally {
+          waking = false;
+        }
+      } catch (error) {
+        api.log.warn('自主生活：生活小结出错 ' + error.message);
       }
       // 安排里到点的事（吃饭这类）
       if (tickTimedItems(s, c)) save(s);
@@ -3346,12 +3357,63 @@ export default {
       addEnergy(s, item.energy != null ? item.energy : energyDelta(item.action || 'life'));
       if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
       s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id, why: String(item.why || '').slice(0, 60) }, ...(s.done || [])].slice(0, 50);
-      try {
-        const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: item.what, tags: ['自主生活', '生活'], importance: 0.3 });
-      } catch (error) {}
+      // 做得怎么样等忙完再写（tickLifeRecaps），记忆也那时候再进
+      item.recapAt = s.busy.until;
       appendLog({ at: now, action: item.action || 'life', why: '安排里定了这个点', detail: '', note: item.what, agendaId: item.id });
       api.log.info(`自主生活：${item.what}（${mins} 分钟）`);
+      return true;
+    }
+
+    /** 到点自己发生的生活小事忙完了：让她用一两句写下做得怎么样，写进当天流水和记忆，之后聊天照这个说 */
+    async function tickLifeRecaps(s, c) {
+      const now = Date.now();
+      const item = (s.agenda.items || []).find((x) => x.recapAt && !x.recapped && x.recapAt <= now);
+      if (!item) return false;
+      item.recapped = true;
+      save(s);
+      const startAt = Number(item.doneAt) || now;
+      const before = (s.done || [])
+        .filter((x) => x && !x.dry && Number(x.at) < startAt && startAt - Number(x.at) <= 3 * 3600_000)
+        .slice(0, 5)
+        .reverse()
+        .map((x) => `${clock(x.at)} ${clip(x.note || x.brief || x.action, 80)}`);
+      const text = [
+        `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚忙完：${item.what}（${clock(startAt)} 开始${item.why ? `，当时想的是：${item.why}` : ''}）。`,
+        before.length ? `这之前做过：\n${before.join('\n')}` : '',
+        styleHint(c),
+        '',
+        '用第一人称写一两句这件事做得怎么样（像跟自己说，不是汇报），50 字以内：成没成、结果怎样、一个具体的小细节。',
+        '只输出 JSON：{"note":"做得怎么样"}',
+      ]
+        .filter((x) => x !== '')
+        .join('\n');
+      let recap = '';
+      try {
+        const out = await ask(api.dsh, { key: 'life-recap', cfg: api.config(),
+          system: '你是一个有自己生活的角色，刚忙完一件事。只输出 JSON。',
+          text,
+          maxTokens: 300,
+          temperature: 0.9,
+          timeoutMs: Math.max(20, Number(c.askTimeoutSec) || 45) * 1000,
+        });
+        const j = parseJsonLoose(out);
+        recap = clip((j && j.note) || '', 60);
+      } catch (error) {
+        api.log.warn('自主生活：写生活小结失败 ' + error.message);
+      }
+      const note = recap ? clip(`${item.what}，${recap}`, 90) : item.what;
+      if (recap) item.note = clip(recap, 60);
+      const d0 = (s.done || []).find((x) => x.agendaId === item.id && Math.abs((Number(x.at) || 0) - startAt) < 5 * 60_000);
+      if (d0 && recap) {
+        d0.note = note;
+        d0.brief = clip(recap, 30);
+      }
+      try {
+        const mem = api.use('memory');
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: clip(note, 140), tags: ['自主生活', '生活'], importance: 0.3 });
+      } catch (error) {}
+      if (recap) appendLog({ at: now, action: 'life-recap', why: item.what, detail: '', note: recap, agendaId: item.id });
+      api.log.info(`自主生活：${item.what} 忙完了${recap ? ' —— ' + recap : ''}`);
       return true;
     }
 
