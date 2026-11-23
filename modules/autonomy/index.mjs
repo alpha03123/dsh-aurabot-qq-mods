@@ -2945,7 +2945,7 @@ export default {
       const MAX = 12;
       const older = Math.max(0, rows.length - MAX);
       const line = (x) => {
-        const what = x.action === 'rest' ? '歇了一会儿' : clip(x.note || x.brief || x.action, 70);
+        const what = x.action === 'rest' ? clip(x.brief || x.note || '歇了一会儿', 70) : clip(x.note || x.brief || x.action, 70);
         return `${clock(x.at)} ${what}${x.why && x.action !== 'rest' ? `（${clip(x.why, 24)}）` : ''}`;
       };
       s.lifeShown = Object.fromEntries([...Object.entries(s.lifeShown || {}).filter(([k]) => k !== key).slice(-4), [key, rows[rows.length - 1].at]]);
@@ -2961,7 +2961,7 @@ export default {
         const { qq } = ownerOf();
         if (!qq || String(chat.userId) !== qq) return `【当前时间】${nowStr}`;
         const s = load();
-        const last = (s.done || []).find((x) => !x.dry && !['rest', 'idle', 'speak', 'timer'].includes(x.action));
+        const last = (s.done || []).find((x) => !x.dry && !['idle', 'speak', 'timer'].includes(x.action));
         const bg = [`现在 ${nowStr}`];
         if (s.weather && s.weather.now) bg.push(`天气：${weatherLine(s.weather, { full: true })}`);
         bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
@@ -3620,7 +3620,12 @@ export default {
               ? `刚睡醒才看到这些消息（最早一条是 ${ago}）`
               : h.reason === 'busy'
                 ? `刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
-                : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
+                : (() => {
+                    const recentRest = (s.done || []).find((x) => x && x.action === 'rest' && Date.now() - (Number(x.at) || 0) < 60 * 60_000 && (x.brief || x.why));
+                    return recentRest
+                      ? `刚才在发呆/歇着（${clip(recentRest.brief || recentRest.why, 28)}），没看手机，现在才看到（最早一条是 ${ago}）`
+                      : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
+                  })();
         const note = `【刚才背景（不必刻意报备，直接正常聊就行）】${head}。`;
         prefix.push({ type: 'text', text: note });
         return [...prefix, ...content];

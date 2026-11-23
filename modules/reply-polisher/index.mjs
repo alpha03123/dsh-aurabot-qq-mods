@@ -2,7 +2,7 @@
  * 回复润色器（本地 Ollama 语言层，2026-11-22）
  *
  * 工作流位置：主模型（DeepSeek 等）产出草稿 → hooks.reply → 本机 Ollama（如 aurabot-v5-ep2）润色拆气泡 → parseReply 发送。
- * 包含分流（技术/代码/长草稿跳过）与兜底校验（协议标签、数字、人称、气泡上限），异常或未通过时自动退回原草稿。
+ * 仅保留技术/超长草稿分流、气泡上限合并与请求异常兜底，不做内容校验退回。
  *
  * @type {import('../aurabot').AurabotModule}
  */
@@ -17,9 +17,7 @@ const SCENE_PRIVATE = '私聊';
 const SCENE_GROUP = '群聊（最多3条气泡，带表情时文字≤2条）';
 
 const SILENCE_SET = new Set(['', '[沉默]', '［沉默］', '(沉默)', '（沉默）']);
-const TAG_RE = /<(?:sticker|reply|at):[^>]*>|<poke>|<voice>/gi;
 const ALL_TAG_RE = /<[^>]*>/g;
-const NUM_RE = /\d+(?:\.\d+)?/g;
 
 function localDay(offsetDays = 0) {
   const d = new Date(Date.now() + offsetDays * 86400_000);
@@ -59,7 +57,6 @@ function shouldSkip(draft, cfg) {
 }
 
 function normalizeDraftForModel(draft) {
-  // 主模型草稿如果已经带了 |||，在喂给润色器前换成空格（不动 <voice> 内），让润色器按训练格式重新自然拆气泡
   return String(draft || '').replace(/\s*\|\|\|\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
 }
 
@@ -68,7 +65,6 @@ function enforceBubbles(text, { inGroup, maxBubbles }) {
   let parts = String(text || '').split('|||').map((p) => p.trim()).filter(Boolean);
   if (!parts.length) return '';
 
-  // 群聊带表情时文字气泡 ≤ 2 条
   if (inGroup && parts.some((p) => /<sticker:/i.test(p))) {
     const nonStickerIdx = [];
     parts.forEach((p, idx) => {
@@ -90,52 +86,19 @@ function enforceBubbles(text, { inGroup, maxBubbles }) {
   return parts.join('|||');
 }
 
-function validateOutput(draft, rawOut, { inGroup, cfg }) {
+function cleanOutput(rawOut, { inGroup, maxBubbles }) {
   let out = String(rawOut || '').trim();
-  // 剥离成对 think 块；未闭合 think 直接判失败
-  out = out.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  if (/<think\b/i.test(out)) return { ok: false, reason: 'think泄漏' };
-  if (!out || SILENCE_SET.has(out)) return { ok: false, reason: '输出为空或沉默' };
-  if (out.length > Math.max(draft.length * 3, 280)) return { ok: false, reason: `输出过长(${out.length})` };
-  if (/<voice>[\s\S]*?\|\|\|[\s\S]*?<\/voice>/i.test(out)) return { ok: false, reason: 'voice内切分' };
-
-  // 协议标签必须完整保留
-  const draftTags = draft.match(TAG_RE) || [];
-  for (const tag of draftTags) {
-    if (!out.includes(tag)) return { ok: false, reason: `缺标签${tag}` };
-  }
-
-  const draftPlain = stripTags(draft);
-  const outPlain = stripTags(out);
-
-  // 阿拉伯数字忠实度（不丢数字、不凭空编造数字）
-  if (cfg.checkNumbers !== false) {
-    const draftNums = new Set(draftPlain.match(NUM_RE) || []);
-    const outNums = new Set(outPlain.match(NUM_RE) || []);
-    for (const n of draftNums) {
-      if (!outNums.has(n)) return { ok: false, reason: `缺数字${n}` };
-    }
-    for (const n of outNums) {
-      if (!draftNums.has(n)) return { ok: false, reason: `多出数字${n}` };
-    }
-  }
-
-  // 人称忠实度：草稿里提到“主人”，输出不能改成别的称呼
-  if (cfg.checkPronoun !== false && draftPlain.includes('主人') && !outPlain.includes('主人')) {
-    return { ok: false, reason: '丢失“主人”称呼' };
-  }
-
-  const fixed = enforceBubbles(out, { inGroup, maxBubbles: cfg.maxBubbles });
-  if (!fixed) return { ok: false, reason: '合并气泡后为空' };
-  return { ok: true, text: fixed };
+  out = out.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think\b[\s\S]*$/gi, '').trim();
+  if (!out || SILENCE_SET.has(out)) return '';
+  return enforceBubbles(out, { inGroup, maxBubbles });
 }
 
 export default {
   id: 'reply-polisher',
   name: '回复润色器（Ollama）',
-  version: '0.1.0-local',
+  version: '0.2.0-local',
   api: 1,
-  description: '把主模型产出的聊天草稿交给本机 Ollama 润色模型（如 aurabot-v5-ep2），去 AI 味、套人设语气、拆多气泡并保留协议标签与数字事实。',
+  description: '把主模型产出的聊天草稿交给本机 Ollama 润色模型（如 aurabot-v5-ep2），去 AI 味、套人设语气、拆多气泡。',
 
   defaults: {
     enabled: false,
@@ -147,8 +110,6 @@ export default {
     maxBubbles: 3,
     recentLines: 4,
     skipTechnical: true,
-    checkNumbers: true,
-    checkPronoun: true,
     styleCard: '',
   },
 
@@ -162,8 +123,6 @@ export default {
     { key: 'maxBubbles', label: '最大气泡数（超出自动合并）', type: 'number', min: 1, max: 5, step: 1 },
     { key: 'recentLines', label: '附带最近对话条数（2~5）', type: 'number', min: 1, max: 8, step: 1 },
     { key: 'skipTechnical', label: '自动跳过含代码/命令/链接的技术草稿', type: 'switch' },
-    { key: 'checkNumbers', label: '校验数字忠实度（缺数字或多出数字时退回原草稿）', type: 'switch' },
-    { key: 'checkPronoun', label: '校验“主人”人称不丢失（丢失时退回原草稿）', type: 'switch' },
     {
       key: 'styleCard',
       label: '风格卡（需与润色模型训练时一致）',
@@ -271,18 +230,18 @@ export default {
         const ms = Date.now() - t0;
         stats.lastMs = ms;
 
-        const checked = validateOutput(draft, rawOut, { inGroup, cfg: c });
-        if (!checked.ok) {
+        const out = cleanOutput(rawOut, { inGroup, maxBubbles: c.maxBubbles });
+        if (!out) {
           stats.fallback++;
-          stats.lastReason = `兜底退回:${checked.reason}`;
-          api.log.warn(`${chatId} 润色未通过校验（${checked.reason}，${ms}ms），退回原草稿`);
-          return { used: false, reason: `兜底退回:${checked.reason}`, ms, rawOut, text: draft };
+          stats.lastReason = '空输出退回';
+          api.log.warn(`${chatId} 润色输出为空（${ms}ms），退回原草稿`);
+          return { used: false, reason: '空输出退回', ms, rawOut, text: draft };
         }
 
         stats.polished++;
         stats.lastReason = 'ok';
-        api.log.info(`${chatId} 已润色（${model}，${ms}ms）：${checked.text.slice(0, 60)}`);
-        return { used: true, reason: 'ok', ms, text: checked.text };
+        api.log.info(`${chatId} 已润色（${model}，${ms}ms）：${out.slice(0, 60)}`);
+        return { used: true, reason: 'ok', ms, text: out };
       } catch (error) {
         const ms = Date.now() - t0;
         stats.lastMs = ms;
