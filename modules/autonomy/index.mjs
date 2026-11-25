@@ -3172,7 +3172,7 @@ export default {
           const dueCatchUp = sessDay < today && s.sessionRolloverDay !== sessDay && (lastDay < today || idleOk);
           if (dueBedtime || dueCatchUp) {
             const targetDay = dueBedtime ? today : sessDay;
-            const r = await mem.sessionRollover(ownerChatId, { day: targetDay, merge: true });
+            const r = await mem.sessionRollover(ownerChatId, { day: targetDay, merge: true, dream: true });
             if (r && r.ok) {
               s.sessionRolloverDay = targetDay;
               save(s);
