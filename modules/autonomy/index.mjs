@@ -399,6 +399,7 @@ export default {
     minInterval: 20,
     maxInterval: 90,
     maxWakesPerDay: 40,
+    fixedSchedule: false,
     awakeFrom: 7,
     awakeTo: 24,
     activityTable: '07-12=0.8\n12-14=1.6\n14-18=1.0\n18-23=0.6\n23-24=1.4',
@@ -463,8 +464,14 @@ export default {
     { key: 'minInterval', label: '最短间隔（分钟）', type: 'number' },
     { key: 'maxInterval', label: '最长间隔（分钟）', type: 'number' },
     { key: 'maxWakesPerDay', label: '每天最多醒几次', type: 'number' },
-    { key: 'awakeFrom', label: '几点开始（0-23）', type: 'number' },
-    { key: 'awakeTo', label: '几点结束（0-23，写 24 表示到半夜）', type: 'number' },
+    {
+      key: 'fixedSchedule',
+      label: '固定作息时间',
+      type: 'switch',
+      hint: '开启后严格按下面的起床/睡觉时间作息；关闭（默认）后由她每天自己决定今晚几点睡、明早几点起（可能起得比你早或睡得比你晚）。',
+    },
+    { key: 'awakeFrom', label: '几点开始（0-23，仅固定作息时生效）', type: 'number' },
+    { key: 'awakeTo', label: '几点结束（0-23，写 24 表示到半夜，仅固定作息时生效）', type: 'number' },
     {
       key: 'activityTable',
       label: '时段活跃度（每行 HH-HH=倍率；<1 更活跃，>1 更安静）',
@@ -615,6 +622,8 @@ export default {
       // 跨天保留：手上在弄的事、以及她发明过的动作——连续性全靠这两个
       const keepProject = s.project;
       const keepOuting = s.outing && s.outing.returnAt > Date.now() - 6 * 3600_000 ? s.outing : null;
+      const keepSleepSchedule = s.sleepSchedule && Number(s.sleepSchedule.wakeAt) > Date.now() - 6 * 3600_000 ? s.sleepSchedule : null;
+      const keepCustomStatus = s.customStatus && typeof s.customStatus === 'object' ? s.customStatus : null;
       const keepCustom = s.customActions;
       const keepFails = { streak: (s.fails && s.fails.streak) || {}, until: (s.fails && s.fails.until) || {} };
       // 定时提醒跨天有效（「明早八点叫我」），只丢掉响过的和过期一天以上的
@@ -648,6 +657,8 @@ export default {
         Object.assign(s, emptyState());
         s.project = keepProject || null;
         s.outing = keepOuting;
+        if (keepSleepSchedule) s.sleepSchedule = keepSleepSchedule;
+        if (keepCustomStatus) s.customStatus = keepCustomStatus;
         s.customActions = keepCustom && typeof keepCustom === 'object' ? keepCustom : {};
         s.fails = keepFails;
         s.yesterday = yesterday;
@@ -671,7 +682,46 @@ export default {
       if (s.project && typeof s.project !== 'object') s.project = null;
       return s;
     }
-    const save = (s) => writeJson(stateFile(), s);
+    let lastDiscordStatusKey = '';
+    let lastDiscordStatusAt = 0;
+    function syncDiscordStatus(s) {
+      try {
+        const g = api.config() || {};
+        if (!g.enabled) return;
+        const now = Date.now();
+        const c = cfg();
+        let status = 'online';
+        let text = '';
+        if (!isAwakeHour(c)) {
+          status = 'idle';
+          text = (s.customStatus && s.customStatus.sleepText) || '💤 睡着了';
+        } else if (s.outing && s.outing.returnAt > now) {
+          text = (s.busy && s.busy.status) || (s.customStatus && s.customStatus.text) || `${s.outing.place || s.outing.what || '出门溜达中'}`;
+        } else if (s.busy && s.busy.until > now && (s.busy.status || s.busy.what)) {
+          text = clip(s.busy.status || (s.customStatus && s.customStatus.text) || s.busy.what, 48);
+        } else if (s.customStatus && s.customStatus.text) {
+          text = clip(s.customStatus.text, 48);
+        } else {
+          const lastDone = (s.done || [])[0];
+          text = lastDone && (lastDone.brief || lastDone.note) ? clip(lastDone.brief || lastDone.note, 36) : '';
+        }
+        const key = `${status}|${text}`;
+        if (key === lastDiscordStatusKey && now - lastDiscordStatusAt < 5 * 60_000) return;
+        const call = (api.core && api.core.onebot && typeof api.core.onebot.call === 'function')
+          ? (act, p) => api.core.onebot.call(act, p, { timeoutMs: 5000 })
+          : (typeof api.onebot === 'function' ? (act, p) => api.onebot(act, p, { timeoutMs: 5000 }) : null);
+        if (!call) return;
+        lastDiscordStatusKey = key;
+        lastDiscordStatusAt = now;
+        Promise.resolve(call('set_self_status', { text, status })).catch(() => {});
+      } catch (error) {}
+    }
+
+    const save = (s) => {
+      writeJson(stateFile(), s);
+      syncDiscordStatus(s);
+    };
+    setTimeout(() => { try { syncDiscordStatus(load()); } catch {} }, 8000).unref?.();
 
     // ── 和主人有关的几样：私聊流水、开口 ─────────────────────────
     const hub = () => (api.core && api.core.hub) || null;
@@ -1457,6 +1507,13 @@ export default {
       s.lastOuting = { day: dayKey(), name: p.name, type: p.type, photoFile: o.photoFile, photoWhat: st.photoWhat, photoOk: st.photoOk, story: st.story, backAt: Date.now() };
       if (st.share && o.photoFile && !s.pendingShare) {
         s.pendingShare = { at: Date.now(), file: o.photoFile, place: p.name, what: st.photoWhat || '这家店', story: st.story };
+      } else if (st.share && st.story && canReachOwnerNow(s)) {
+        try {
+          const r = await reachOwner(s, { what: `刚从${p.name}回来，想顺手聊聊：${clip(st.story, 80)}`, why: o.wish || '' });
+          if (r && r.ok) api.log.info(`自主生活：出门回来顺手找主人聊了（${p.name}）`);
+        } catch (error) {
+          api.log.warn('自主生活：出门回来顺手找主人失败 ' + error.message);
+        }
       }
       appendLog({ at: Date.now(), action: 'outing-back', why: o.wish, detail: p.name, note });
       api.log.info(`自主生活：出门回来 —— ${note}${s.pendingShare && s.pendingShare.file === o.photoFile ? '（想把照片发给主人）' : ''}`);
@@ -2005,12 +2062,12 @@ export default {
     function availableActions(ownerName, s) {
       const rows = [];
       const ok = (a) => !(s ? cantDo(s, a) : moduleMissing(a));
-      if (ok('bili')) rows.push('bili：去 B 站逛逛');
+      if (ok('bili')) rows.push('bili：去 B 站刷会儿视频放松，或搜感兴趣的内容/教程看看（刷到有意思的还能顺手分享给主人）');
       if (ok('draw')) rows.push('draw：画一张图');
       if (ok('diary')) rows.push('diary：写一篇只给自己看的日记');
       if (ok('web')) rows.push('web：自己上网查点东西、看看网页（detail 写想查什么）');
       if (ok('phone')) rows.push('phone：拿起手机逛 App');
-      if (s && ok('outing')) rows.push('outing：出门去附近真实存在的地方（想去哪都行：书店、江边、花店、面馆……），具体去哪家到时候在地图上挑');
+      if (s && ok('outing')) rows.push('outing：出门去附近某个真实地方逛逛或办事（按你的兴趣、心情和天气自己想，到时候在地图上挑具体哪家）');
       rows.push(`speak：找${ownerName}说句话（要有具体想说的事）`);
       rows.push('也可以是生活里的事：吃饭、散步、洗澡、收拾房间、看会儿书、窝着听歌……起个短名字、写清楚做什么就行，这些都算你真过了这一段');
       return rows;
@@ -2089,7 +2146,7 @@ export default {
         '',
         '怎么排：',
         `- 吃饭另算（见下面），除此之外排 4~6 件你自己的事。每件都写大概几点开始（time）、要多久（busyMin）。现在是 ${clock()}，已经过去的时间别排；起得晚、剩下的时间少，就按比例少排。到了那个点系统会叫你，到时候还可以改主意。`,
-        '- 这几件别都是一类：窝着看东西、上网查点什么、动手做点什么、出门走走、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
+        '- 这几件别都是一类：刷会儿 B 站（bili）、上网查点什么（web）、动手做点什么、出门逛逛（outing）、收拾整理、写点东西……尽量错开，别一整天都在同一个场景里。昨天做得最多的那类今天少排。',
         '- 查东西和动手做是两件事，分开排：查（bili / web）是一条，查完这条就算做完；真动手做（下厨、缝补、拼东西这类）是另一条生活里的事，action 自己起名字，到点就当你在做。',
         `- 大部分是你自己的事：你自己的兴趣、在弄的东西、想看想学的。跟${owner}有关的最多一条，而且要有具体由头（比如聊天里提到的事），别写"找他聊天"这种空话，平常天气只是背景也不算由头（真要下雨或明显降温提醒带伞添衣才算）。`,
         `- 不用把时间塞满。想留一段空闲就排一条 action 写「${FREE_ACTION}」（what 写「下午随便待着」这类），到点你再看那会儿想干嘛；心情不好可以少排，想偷懒也行。`,
@@ -2097,7 +2154,7 @@ export default {
         '',
         y && (y.items.length || y.done.length) ? '先用你自己的口气说一两句昨天过得怎么样，没做成的也照实说，然后排今天。' : '',
         '只输出 JSON：',
-        '{"yesterday":"一两句，昨天过得怎么样（没有昨天就空着）","theme":"今天大概想怎么过，一句话","items":[{"slot":"morning/afternoon/evening/night","what":"具体想做的事，20 字以内","why":"为什么想做，一句","action":"上面能做的事之一（bili/web/outing/diary/draw/speak…）、free（空闲），或你给生活小事起的短名字","time":"几点开始，比如 14:30","busyMin":"大概占多少分钟","canPause":"这段时间有人找你能不能放下先回，true/false","energy":"做完精力怎么变，-10 到 +25"}]}',
+        '{"yesterday":"一两句，昨天过得怎么样（没有昨天就空着）","theme":"今天大概想怎么过，一句话","sleepTime":"你今晚大概打算几点睡（22:00 到 01:30 之间自己定，比如 23:25 或 00:20）","wakeTime":"明早大概打算几点起（06:30 到 10:30 之间自己定，比如 07:45 或 09:15）","status":"你刚醒这会儿想挂在自己 Discord 状态栏上的一句小状态（15字以内，用你自己的语气，可带1个小emoji）","items":[{"slot":"morning/afternoon/evening/night","what":"具体想做的事，20 字以内","why":"为什么想做，一句","action":"上面能做的事之一（bili/web/outing/diary/draw/speak…）、free（空闲），或你给生活小事起的短名字","time":"几点开始，比如 14:30","busyMin":"大概占多少分钟","canPause":"这段时间有人找你能不能放下先回，true/false","energy":"做完精力怎么变，-10 到 +25","status":"做这件事时挂在自己 Discord 状态栏上的一句短话（15字以内，用你自己的语气，可带1个小emoji）"}]}',
       ]
         .filter((x) => x !== '')
         .join('\n');
@@ -2139,6 +2196,47 @@ export default {
       }
 
       a.theme = clip(j.theme, 40);
+      if (j.status) s.customStatus = { text: clip(j.status, 36), at: Date.now() };
+      if (!c.fixedSchedule) {
+        const parseHM = (str) => {
+          const mm = String(str || '').trim().match(/^(\d{1,2})[:：](\d{2})$/);
+          if (!mm) return null;
+          const h = Number(mm[1]), m = Number(mm[2]);
+          if (!(h >= 0 && h < 24 && m >= 0 && m < 60)) return null;
+          return { h, m };
+        };
+        const sp = parseHM(j.sleepTime);
+        const wk = parseHM(j.wakeTime);
+        const now0 = Date.now();
+        let sleepAt = 0;
+        if (sp && (sp.h >= 21 || sp.h <= 2)) {
+          const dS = new Date(now0);
+          if (sp.h <= 2) dS.setDate(dS.getDate() + 1);
+          dS.setHours(sp.h, sp.m, 0, 0);
+          if (dS.getTime() > now0 + 15 * 60_000) sleepAt = dS.getTime();
+        }
+        if (!sleepAt) {
+          const dS = new Date(now0);
+          dS.setHours(23, Math.floor(Math.random() * 50), 0, 0);
+          if (dS.getTime() <= now0 + 15 * 60_000) dS.setTime(now0 + 2 * 3600_000);
+          sleepAt = dS.getTime();
+        }
+        let wakeAt = 0;
+        if (wk && wk.h >= 6 && wk.h <= 11) {
+          const dW = new Date(sleepAt);
+          if (dW.getHours() >= 18) dW.setDate(dW.getDate() + 1);
+          dW.setHours(wk.h, wk.m, 0, 0);
+          if (dW.getTime() > sleepAt + 4 * 3600_000) wakeAt = dW.getTime();
+        }
+        if (!wakeAt) {
+          const dW = new Date(sleepAt);
+          if (dW.getHours() >= 18) dW.setDate(dW.getDate() + 1);
+          dW.setHours(7 + Math.floor(Math.random() * 3), Math.floor(Math.random() * 60), 0, 0);
+          wakeAt = dW.getTime();
+        }
+        s.sleepSchedule = { sleepAt, wakeAt, sleepText: clock(sleepAt), wakeText: clock(wakeAt) };
+        api.log.info(`自主生活：她今天自定作息 —— 今晚 ${clock(sleepAt)} 左右睡，明早 ${clock(wakeAt)} 左右起`);
+      }
       const added = [];
       for (const it of (Array.isArray(j.items) ? j.items : []).slice(0, 10)) {
         if (!it || typeof it !== 'object') continue;
@@ -2153,7 +2251,7 @@ export default {
         }
         const slot = at ? slotOf(new Date(at).getHours()) : it.slot;
         if (!at && slotPassed(slot, hour)) continue; // 没写时间、又排到已经过去的时段：丢掉
-        const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at, ...(at ? selfReport(it) : {}) }, { hour });
+        const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at, ...selfReport(it) }, { hour });
         if (r.ok) added.push(r.item);
       }
       const recap = clip(j.yesterday, 120);
@@ -2351,7 +2449,7 @@ export default {
         personaLimits() ? `你做不到的事（安排里写了也做不成，换个做法或者划掉）：\n${personaLimits()}` : '',
         '',
         '只回一个 JSON：',
-        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","place":"","ops":[],"busyMin":30,"canPause":true,"energy":-2}',
+        '{"action":"上面某一个动作，或者你给生活里的事起的短名字","kind":"soft/learn/build/other 之一","why":"一句话理由","detail":"想做什么的简短描述","status":"你现在想挂在自己 Discord 状态栏上的一句小状态（15字以内，用你自己的口气，可带1个小emoji）","agendaId":"这次是在做安排里的哪一条（比如 a2），不是就空字符串","agendaDone":true,"topic":"这件事说的是什么，几个字","query":"","place":"","ops":[],"busyMin":30,"canPause":true,"energy":-2}',
         'agendaDone：填了 agendaId 才看——这一轮做完，那条是不是就算做完了；只是为它查资料、看教程、做准备，写 false。',
         'topic：这件事说的是什么，几个字（「马克杯蛋糕」「Re0」「厚外套」）；跟上面列过的是同一件事就沿用同一个名字。query：web、bili、outing 才填——web 是拿去搜索引擎搜的关键词，bili 是 B 站搜索框里搜的词（随便刷就空着），outing 是地图上搜的词。place：只有 outing 才填，想去什么样的地方。',
         'busyMin / canPause / energy 说的是这件事本身，按你自己的情况填：busyMin 大概要占你多少分钟（不占手就 0）；canPause 这期间有人找你，能不能随手放下先回（true / false）；energy 做完精力大概怎么变（-10 到 +25 的整数，回血就正，累人就负）。',
@@ -2576,7 +2674,9 @@ export default {
         const own = d.busyMin != null ? d.busyMin : item && item.busyMin != null ? item.busyMin : null;
         const mins = NOT_BUSY_ACTIONS.includes(d.action) ? 0 : Number(result.extra && result.extra.busyMin) || (own != null ? own : busyMinutes(d.action));
         const canPause = d.canPause != null ? d.canPause : item && item.canPause != null ? item.canPause : null;
-        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause };
+        const stText = clip(d.status || (item && item.status) || '', 36);
+        if (stText) s.customStatus = { text: stText, at };
+        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause, ...(stText ? { status: stText } : {}) };
       }
       s.done = [
         { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.state === 'done' ? item.what : '') || d.detail || d.why, 30), dry, kind: d.kind || '', why: String(d.why || '').slice(0, 60), ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
@@ -2877,6 +2977,25 @@ export default {
           },
         }),
         api.defineTool({
+          name: 'my_status',
+          description: '更新你自己挂在 Discord 头像旁边的自定义状态栏文字（15字以内，用你自己的口气，可带1个小emoji，比如「🌧️ 窝窗边听雨发呆喵」「🍅 刚炫完番茄鸡蛋盖饭」）。主人让你改状态，或者你心情/在做的事变了想换个状态时调用。',
+          properties: {
+            text: { type: 'string', description: '想挂在状态栏上的一句短话（15字以内）' },
+            status: { type: 'string', description: '在线圆点：online（绿，默认）/ idle（黄月亮）/ dnd（红请勿打扰）' },
+          },
+          execute: async (args) => {
+            const a = args || {};
+            const text = clip(a.text, 36);
+            const st = ['online', 'idle', 'dnd'].includes(a.status) ? a.status : 'online';
+            const s = load();
+            s.customStatus = { text, status: st, at: Date.now() };
+            if (s.busy && s.busy.until > Date.now() && text) s.busy.status = text;
+            lastDiscordStatusKey = '';
+            save(s);
+            return { ok: true, message: `状态栏已换成：${text || '（清空）'}` };
+          },
+        }),
+        api.defineTool({
           name: 'my_agenda',
           description:
             '看或改你今天的安排。和主人约了事（「晚上陪我聊聊那部番」「今天别等我了」「十点提醒我睡觉」「明早八点叫我」）就用它记下或改掉，别只是嘴上答应。' +
@@ -2966,6 +3085,19 @@ export default {
         if (s.weather && s.weather.now) bg.push(`天气：${weatherLine(s.weather, { full: true })}`);
         bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
         const parts = [`【当前背景（仅作背景知晓，不必刻意提起或报备）】${bg.join('｜')}`];
+        const todoItems = ((s.agenda && s.agenda.items) || []).filter((x) => x && x.state === 'todo' && x.what);
+        const pendingTimers = (s.timers || []).filter((t) => t && !t.fired && t.at > Date.now() && t.what);
+        const cNow = cfg();
+        const sleepHint = !cNow.fixedSchedule && s.sleepSchedule && Number(s.sleepSchedule.sleepAt) > Date.now()
+          ? `今晚打算 ${clock(s.sleepSchedule.sleepAt)} 左右睡（明早 ${clock(s.sleepSchedule.wakeAt)} 左右起）`
+          : `平时大概 ${Number(cNow.awakeTo) === 24 ? '半夜12点' : (Number(cNow.awakeTo) || 23) + '点'} 左右睡`;
+        if (todoItems.length || pendingTimers.length || sleepHint) {
+          const slotZh = { morning: '上午', afternoon: '下午', evening: '晚上', night: '深夜' };
+          const briefItems = todoItems.slice(0, 6).map((x) => `${x.at ? clock(x.at) + '·' : (slotZh[x.slot] ? slotZh[x.slot] + '·' : '')}${clip(x.what, 18)}`);
+          for (const t of pendingTimers.slice(0, 2)) briefItems.push(`${clock(t.at)}·${clip(t.what, 16)}`);
+          if (sleepHint) briefItems.push(sleepHint);
+          parts.push(`【今天还打算（仅作自身状态知晓，聊到今天安排或作息时自然提起，没聊到不用报备）】${briefItems.join('、')}`);
+        }
         const life = lifeLogBlock(s, sessionId);
         if (life) parts.push(life);
         if (s.energy && isAwakeHour(cfg())) {
@@ -3093,28 +3225,54 @@ export default {
       if (a && a.kind === 'out' && a.chatId) lastOut.set(a.chatId, Date.now());
     });
     const randMin = (lo, hi) => Math.round((lo + Math.random() * (hi - lo)) * 60_000);
-    const isAwakeHour = (c, hour = new Date().getHours()) => {
+    const fixedIsAwakeHour = (c, hour = new Date().getHours()) => {
       const from = Number(c.awakeFrom) || 0;
       const to = Number(c.awakeTo) || 24;
       return from <= to ? hour >= from && hour < to : hour >= from || hour < to;
     };
+    const isAwakeHour = (c, hour = null) => {
+      if (hour !== null && hour !== undefined) return fixedIsAwakeHour(c, hour);
+      if (c.fixedSchedule) return fixedIsAwakeHour(c, new Date().getHours());
+      try {
+        const sc = readJson(stateFile(), null)?.sleepSchedule;
+        if (sc && Number(sc.sleepAt) > 0 && Number(sc.wakeAt) > Number(sc.sleepAt)) {
+          const now = Date.now();
+          if (now >= Number(sc.sleepAt) && now < Number(sc.wakeAt)) return false;
+          if (now < Number(sc.sleepAt)) return true;
+          if (now >= Number(sc.wakeAt) && now < Number(sc.wakeAt) + 18 * 3600_000) return true;
+        }
+      } catch (error) {}
+      return fixedIsAwakeHour(c, new Date().getHours());
+    };
     /** 下一次「几点开始活跃」的时间点 */
     function nextAwakeAt(c, now = Date.now()) {
+      if (!c.fixedSchedule) {
+        try {
+          const sc = readJson(stateFile(), null)?.sleepSchedule;
+          if (sc && Number(sc.wakeAt) > now) return Number(sc.wakeAt);
+        } catch (error) {}
+      }
       const d = new Date(now);
       d.setMinutes(0, 0, 0);
       for (let i = 0; i < 48; i += 1) {
         d.setHours(d.getHours() + 1);
-        if (isAwakeHour(c, d.getHours())) return d.getTime();
+        if (fixedIsAwakeHour(c, d.getHours())) return d.getTime();
       }
       return now + 8 * 3600_000;
     }
     /** 下一次「几点睡觉」（离开活跃时段）的时间点；全天都醒着返回 0 */
     function nextSleepAt(c, now = Date.now()) {
+      if (!c.fixedSchedule) {
+        try {
+          const sc = readJson(stateFile(), null)?.sleepSchedule;
+          if (sc && Number(sc.sleepAt) > now) return Number(sc.sleepAt);
+        } catch (error) {}
+      }
       const d = new Date(now);
       d.setMinutes(0, 0, 0);
       for (let i = 0; i < 48; i += 1) {
         d.setHours(d.getHours() + 1);
-        if (!isAwakeHour(c, d.getHours())) return d.getTime();
+        if (!fixedIsAwakeHour(c, d.getHours())) return d.getTime();
       }
       return 0;
     }
@@ -3224,7 +3382,9 @@ export default {
       item.state = 'done';
       item.note = item.what;
       item.doneAt = now;
-      s.busy = { since: now, until: now + mins * 60_000, what: item.what, canPause: item.canPause != null ? item.canPause : null };
+      const stText = clip(item.status || item.what, 36);
+      if (stText) s.customStatus = { text: stText, at: now };
+      s.busy = { since: now, until: now + mins * 60_000, what: item.what, canPause: item.canPause != null ? item.canPause : null, ...(stText ? { status: stText } : {}) };
       addEnergy(s, item.energy != null ? item.energy : energyDelta(item.action || 'life'));
       if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
       s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id, why: String(item.why || '').slice(0, 60) }, ...(s.done || [])].slice(0, 50);
@@ -3248,29 +3408,44 @@ export default {
         .slice(0, 5)
         .reverse()
         .map((x) => `${clock(x.at)} ${clip(x.note || x.brief || x.action, 80)}`);
+      const canShare = canReachOwnerNow(s);
+      const ownerName = ownerOf().name;
       const text = [
         `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚忙完：${item.what}（${clock(startAt)} 开始${item.why ? `，当时想的是：${item.why}` : ''}）。`,
         before.length ? `这之前做过：\n${before.join('\n')}` : '',
         styleHint(c),
         '',
-        '用第一人称写一两句这件事做得怎么样（像跟自己说，不是汇报），50 字以内：成没成、结果怎样、一个具体的小细节。',
-        '只输出 JSON：{"note":"做得怎么样"}',
+        '用第一人称写一两句这件事做得怎么样（像跟自己说，不是汇报），50 字以内：成没成、结果怎样、一个具体的小细节。顺便写一句忙完之后现在挂在自己 Discord 状态栏上的小状态（15字以内，用你自己的口气，可带1个小emoji）。',
+        canShare
+          ? `如果这件事做得特别开心、有趣或翻车了，你真有冲动顺手跟${ownerName}显摆或吐槽一句，就在 share 里写一句想聊什么；普通例行小事（比如普通吃顿饭）不用每件都报备，share 留空字符串。`
+          : '',
+        canShare
+          ? '只输出 JSON：{"note":"做得怎么样","status":"现在的状态栏短句","share":"想顺手跟他说什么（不想说就空字符串）"}'
+          : '只输出 JSON：{"note":"做得怎么样","status":"现在的状态栏短句"}',
       ]
         .filter((x) => x !== '')
         .join('\n');
       let recap = '';
+      let nextStatus = '';
+      let wantShare = '';
       try {
         const out = await ask(api.dsh, { key: 'life-recap', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚忙完一件事。只输出 JSON。',
           text,
-          maxTokens: 300,
+          maxTokens: 320,
           temperature: 0.9,
           timeoutMs: Math.max(20, Number(c.askTimeoutSec) || 45) * 1000,
         });
         const j = parseJsonLoose(out);
         recap = clip((j && j.note) || '', 60);
+        nextStatus = clip((j && j.status) || '', 36);
+        wantShare = canShare ? clip((j && j.share) || '', 80) : '';
       } catch (error) {
         api.log.warn('自主生活：写生活小结失败 ' + error.message);
+      }
+      if (nextStatus) {
+        s.customStatus = { text: nextStatus, at: now };
+        save(s);
       }
       const note = recap ? clip(`${item.what}，${recap}`, 90) : item.what;
       if (recap) item.note = clip(recap, 60);
@@ -3285,6 +3460,17 @@ export default {
       } catch (error) {}
       if (recap) appendLog({ at: now, action: 'life-recap', why: item.what, detail: '', note: recap, agendaId: item.id });
       api.log.info(`自主生活：${item.what} 忙完了${recap ? ' —— ' + recap : ''}`);
+      if (wantShare && canReachOwnerNow(s)) {
+        try {
+          const r = await reachOwner(s, { what: wantShare, why: `刚忙完「${item.what}」${recap ? `：${recap}` : ''}` });
+          if (r && r.ok) {
+            appendLog({ at: Date.now(), action: 'speak', why: `刚忙完「${item.what}」顺手分享`, detail: wantShare, note: r.note, agendaId: item.id });
+            api.log.info(`自主生活：忙完「${item.what}」后顺手找主人聊了 —— ${clip(wantShare, 40)}`);
+          }
+        } catch (error) {
+          api.log.warn('自主生活：忙完后顺手找主人失败 ' + error.message);
+        }
+      }
       return true;
     }
 
@@ -3360,32 +3546,35 @@ export default {
       const now = Date.now();
       const me = personaBrief();
       const leftMin = Math.max(1, Math.round((ctx.untilAt - now) / 60_000));
+      // 只有真正脱不开身（canPause === false）才允许晚回较久；出门逛街/书店/轻松状态最多延后 2 分钟，避免故意晾人
+      const maxDelay = ctx.canPause === false ? Math.min(leftMin, 15) : Math.min(leftMin, 2);
       const doing = ctx.place
         ? `在外面（${ctx.place}），手机在身上，大概 ${clock(ctx.untilAt)} 回到家`
         : `正在${ctx.what || '忙自己的事'}，大概 ${clock(ctx.untilAt)} 弄完`;
-      const pause = ctx.canPause === false ? '（你之前说过这件事中途放不下）' : ctx.canPause === true ? '（你之前说过这件事随时能放下）' : '';
+      const pause = ctx.canPause === false ? '（你之前说过这件事中途放不下）' : ctx.canPause === true ? '（你之前说过这件事随时能放下）' : '（在外面闲逛/歇脚时通常能随手看手机）';
       const text = [
         me.brief ? `你的人设：${me.brief}` : '',
         `现在 ${clock(now)}。你${doing}${pause}。`,
         `${ctx.who}给你发了私聊：`,
         ...texts.map((t) => `「${t}」`),
         ctx.prevUntil ? `（你本来打算 ${clock(ctx.prevUntil)} 再看手机，现在又来了上面这些）` : '',
-        '你会马上拿起手机回，还是先把手上的事弄完、过一会儿再看？按你自己的性子、手上的事和消息内容来定。',
-        `只回 JSON：{"minutes":0,"why":"一句话"} —— minutes 是过几分钟再看（0 = 现在就回，最多 ${leftMin}）。`,
+        '你会马上拿起手机回，还是过一会儿再看？如果不是真的脱不开身（比如只是在逛店、躲雨、发呆），通常 0 分钟直接回，顶多延后 1~2 分钟，别故意晾对方太久。',
+        `只回 JSON：{"minutes":0,"why":"一句话"} —— minutes 是过几分钟再看（0 = 现在就回，最多 ${maxDelay}）。`,
       ].filter(Boolean).join('\n');
       try {
         const out = await ask(api.dsh, { key: 'hold', cfg: api.config(), system: `你是${me.name || '一个有自己生活的角色'}，手机响了，决定什么时候看。只输出 JSON。`, text, maxTokens: 200, temperature: 0.7, timeoutMs: 30_000 });
         const j = parseJsonLoose(out) || {};
         const m = Number(j.minutes);
-        const minutes = Number.isFinite(m) ? Math.max(0, Math.min(leftMin, 60, Math.round(m))) : 0;
-        api.log.info(`自主生活：${ctx.who}发来私聊（${texts.length} 条），她${minutes ? `打算 ${minutes} 分钟后再看` : '现在就回'}——${clip(j.why || '', 40)}`);
-        return minutes;
+        const minutes = Number.isFinite(m) ? Math.max(0, Math.min(maxDelay, Math.round(m))) : 0;
+        const why = clip(j.why || '', 60);
+        api.log.info(`自主生活：${ctx.who}发来私聊（${texts.length} 条），她${minutes ? `打算 ${minutes} 分钟后再看` : '现在就回'}——${clip(why, 40)}`);
+        return { minutes, why };
       } catch (error) {
         api.log.warn('自主生活：问小脑回不回出错，直接回 ' + error.message);
-        return 0;
+        return { minutes: 0, why: '' };
       }
     }
-    /** 合并同一个聊天这几秒来的消息，只问一次；返回 { id, minutes }，同一批拿到同一个 id */
+    /** 合并同一个聊天这几秒来的消息，只问一次；返回 { id, minutes, why }，同一批拿到同一个 id */
     function judgeReply(chatId, text, ctx) {
       let j = judging.get(chatId);
       if (!j) {
@@ -3396,7 +3585,7 @@ export default {
             batch.closed = true;
             return askJudge(batch.texts, ctx);
           })
-          .then((minutes) => ({ id: batch.id, minutes }))
+          .then(({ minutes, why }) => ({ id: batch.id, minutes, why }))
           .finally(() => {
             if (judging.get(chatId) === batch) judging.delete(chatId);
           });
@@ -3455,6 +3644,7 @@ export default {
             const t = Date.now();
             if (t + r.minutes * 60_000 < h2.until) {
               h2.until = t + r.minutes * 60_000;
+              if (r.why) h2.why = r.why;
               if (r.minutes === 0) h2.woken = true;
             }
             save(s2);
@@ -3502,16 +3692,14 @@ export default {
             return e.until - t;
           }
           const what2 = b.place ? `外面（${b.place}）` : b.what;
-          held2[info.chatId] = { since: t, until: t + r.minutes * 60_000, reason: 'busy', what: what2, count: 1, judged: 1, judgeId: r.id, userId: String(info.userId || '') };
+          held2[info.chatId] = { since: t, until: t + r.minutes * 60_000, reason: 'busy', what: what2, why: r.why || '', count: 1, judged: 1, judgeId: r.id, userId: String(info.userId || '') };
           save(s2);
           api.log.info(`自主生活：${info.chatId} 的消息晚点回（在${what2}，约 ${r.minutes} 分钟后）`);
           return r.minutes * 60_000;
         } else if (isUrgent(info.text)) {
           return 0;
-        } else if (Math.random() < 0.2) {
-          until = now + randMin(1, 4);
-          reason = 'away';
         }
+        // 本地改：去掉闲着时 20% 随机「没看手机」晚回，仅在真正睡着或日程正忙时触发晚回
         if (!until) return 0;
         held[info.chatId] = { since: now, until, reason, what, count: 1, userId: String(info.userId || '') };
         save(s);
@@ -3619,14 +3807,16 @@ export default {
             : h.reason === 'sleep'
               ? `刚睡醒才看到这些消息（最早一条是 ${ago}）`
               : h.reason === 'busy'
-                ? `刚才在${h.what || '忙别的'}，现在才看到（最早一条是 ${ago}）`
+                ? `刚才在${h.what || '忙别的'}${h.why ? `（你当时心里想的是：${clip(h.why, 50)}）` : ''}，现在才回（最早一条是 ${ago}）`
                 : (() => {
                     const recentRest = (s.done || []).find((x) => x && x.action === 'rest' && Date.now() - (Number(x.at) || 0) < 60 * 60_000 && (x.brief || x.why));
                     return recentRest
                       ? `刚才在发呆/歇着（${clip(recentRest.brief || recentRest.why, 28)}），没看手机，现在才看到（最早一条是 ${ago}）`
                       : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
                   })();
-        const note = `【刚才背景（不必刻意报备，直接正常聊就行）】${head}。`;
+        const note = mins >= 2 || h.reason === 'sleep'
+          ? `【晚回提醒】${head}。晚回了一会儿，回复时可以自然顺嘴带一句刚才在干嘛（像平时跟朋友聊那样随口一提，别像写检讨）。`
+          : `【刚才背景（不必刻意报备，直接正常聊就行）】${head}。`;
         prefix.push({ type: 'text', text: note });
         return [...prefix, ...content];
       } catch (error) {
@@ -3691,10 +3881,13 @@ export default {
         : '你有一本只给自己看的日记，不给任何人看，别人问起就岔开。';
     });
 
-    // 惦记他的事：聊天里听到之后的事 / 身体不舒服 / 在烦的事，自己记一条跟进
+    // 自己的日程管理 + 惦记他的事
     api.rule((kind) => {
       if (kind !== 'private' || !cfg().enabled) return '';
-      return '主人说到之后会发生的事（面试、考试、看病、出差、交稿、约了人）、身体不舒服、或者在烦心的事，悄悄用 my_agenda 记一条 kind=followup 的跟进：what 写到时候要问什么（「问他面试怎么样」），day / time 写什么时候问合适（面试当天晚上、看完病第二天）。别告诉他你记下了，到时候自然地去问；同一件事记一次就够，小事别记。';
+      return [
+        '你有自己的每日日程（由 my_agenda 管理）：想看完整时间/编号，或主人临时约事、改时间、让你加/删/挪某项安排时，用 my_agenda（action=show/add/drop/defer/done）处理，别只嘴上答应。',
+        '主人说到之后会发生的事（面试、考试、看病、出差、交稿、约了人）、身体不舒服、或者在烦心的事，悄悄用 my_agenda 记一条 kind=followup 的跟进：what 写到时候要问什么（「问他面试怎么样」），day / time 写什么时候问合适（面试当天晚上、看完病第二天）。别告诉他你记下了，到时候自然地去问；同一件事记一次就够，小事别记。',
+      ];
     });
 
     function agendaText() {

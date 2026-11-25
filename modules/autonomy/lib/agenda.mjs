@@ -85,7 +85,7 @@ export function normalizeAgenda(raw, date) {
  * 和还没做的那几条太像就不加：后台最常见的毛病就是同一件待办换个说法再塞一遍。
  * 已经做完的不拦：今天做过的事想再来一次（蛋糕塌了再试一回）是她自己的决定。
  */
-export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0, busyMin = null, canPause = null, energy = null } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
+export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0, busyMin = null, canPause = null, energy = null, status = null } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
   const w = clip(what, 40);
   if (!w) return { ok: false, reason: '没写要做什么' };
   if (agenda.items.length >= MAX_ITEMS) return { ok: false, reason: `今天已经排了 ${MAX_ITEMS} 条，别再加了` };
@@ -106,6 +106,7 @@ export function addItem(agenda, { slot, what, why = '', from = 'self', action = 
     ...(busyMin !== null ? { busyMin } : {}),
     ...(canPause !== null ? { canPause } : {}),
     ...(energy !== null ? { energy } : {}),
+    ...(status ? { status: clip(status, 36) } : {}),
   };
   agenda.nextId += 1;
   agenda.items.push(item);
@@ -364,10 +365,12 @@ export function selfReport(j) {
   const busy = n(o.busyMin);
   const energy = n(o.energy);
   const cp = o.canPause === true || o.canPause === 'true' ? true : o.canPause === false || o.canPause === 'false' ? false : null;
+  const st = clip(o.status, 36) || null;
   return {
     busyMin: busy === null ? null : Math.round(Math.max(0, Math.min(360, busy))),
     canPause: cp,
     energy: energy === null ? null : Math.round(Math.max(-15, Math.min(30, energy))),
+    ...(st ? { status: st } : {}),
   };
 }
 

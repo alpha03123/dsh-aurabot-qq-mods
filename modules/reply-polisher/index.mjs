@@ -1,7 +1,7 @@
 /**
  * 回复润色器（本地 Ollama 语言层，2026-11-22）
  *
- * 工作流位置：主模型（DeepSeek 等）产出草稿 → hooks.reply → 本机 Ollama（如 aurabot-v5-ep2）润色拆气泡 → parseReply 发送。
+ * 工作流位置：主模型（DeepSeek 等）产出草稿 → hooks.reply → 本机 Ollama（如 aurabot-v6-terra-ep2）润色拆气泡 → parseReply 发送。
  * 仅保留技术/超长草稿分流、气泡上限合并与请求异常兜底，不做内容校验退回。
  *
  * @type {import('../aurabot').AurabotModule}
@@ -98,15 +98,15 @@ export default {
   name: '回复润色器（Ollama）',
   version: '0.2.0-local',
   api: 1,
-  description: '把主模型产出的聊天草稿交给本机 Ollama 润色模型（如 aurabot-v5-ep2），去 AI 味、套人设语气、拆多气泡。',
+  description: '把主模型产出的聊天草稿交给本机 Ollama 润色模型（如 aurabot-v6-terra-ep2），去 AI 味、套人设语气、拆多气泡。',
 
   defaults: {
     enabled: false,
     baseUrl: 'http://127.0.0.1:11434',
-    model: 'aurabot-v5-ep2',
-    keepAlive: '15m',
-    timeoutMs: 8000,
-    maxDraftChars: 150,
+    model: 'aurabot-v6-terra-ep2',
+    keepAlive: '30m',
+    timeoutMs: 45000,
+    maxDraftChars: 220,
     maxBubbles: 3,
     recentLines: 4,
     skipTechnical: true,
@@ -116,9 +116,9 @@ export default {
   settings: [
     { key: 'enabled', label: '启用润色器', type: 'switch' },
     { key: 'baseUrl', label: 'Ollama 地址', type: 'text', placeholder: 'http://127.0.0.1:11434' },
-    { key: 'model', label: 'Ollama 模型名', type: 'text', placeholder: 'aurabot-v5-ep2' },
-    { key: 'keepAlive', label: '模型常驻时间（keep_alive）', type: 'text', placeholder: '15m', hint: '避免每次冷启动重新加载模型，如 15m、30m、1h' },
-    { key: 'timeoutMs', label: '超时时间（毫秒）', type: 'number', min: 1500, max: 30000, step: 500 },
+    { key: 'model', label: 'Ollama 模型名', type: 'text', placeholder: 'aurabot-v6-terra-ep2' },
+    { key: 'keepAlive', label: '模型常驻时间（keep_alive）', type: 'text', placeholder: '30m', hint: '避免每次冷启动重新加载模型，如 15m、30m、1h' },
+    { key: 'timeoutMs', label: '超时时间（毫秒）', type: 'number', min: 1500, max: 60000, step: 500 },
     { key: 'maxDraftChars', label: '草稿最大字数（超出跳过润色，0=不限）', type: 'number', min: 0, max: 1000, step: 10 },
     { key: 'maxBubbles', label: '最大气泡数（超出自动合并）', type: 'number', min: 1, max: 5, step: 1 },
     { key: 'recentLines', label: '附带最近对话条数（2~5）', type: 'number', min: 1, max: 8, step: 1 },
