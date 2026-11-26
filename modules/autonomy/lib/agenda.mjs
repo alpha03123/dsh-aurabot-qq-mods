@@ -128,8 +128,10 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
       const from = by === 'owner' ? 'promise' : raw.from === 'seen' ? 'seen' : 'self';
       const at = clockToday(raw.time, now);
       const r = addItem(agenda, { slot: at ? slotOf(new Date(at).getHours()) : raw.slot, what: raw.what, why, from, action: raw.action, at }, { hour, now });
-      if (r.ok) applied.push(`加了 ${r.item.id}「${r.item.what}」（${at ? fmtClock(at) : SLOT_LABEL[r.item.slot]}）`);
-      else rejected.push(`没加「${clip(raw.what, 20)}」：${r.reason}`);
+      if (r.ok) {
+        if (by === 'owner') r.item.ownerAt = now;
+        applied.push(`加了 ${r.item.id}「${r.item.what}」（${at ? fmtClock(at) : SLOT_LABEL[r.item.slot]}）`);
+      } else rejected.push(`没加「${clip(raw.what, 20)}」：${r.reason}`);
       continue;
     }
     const item = agenda.items.find((x) => x.id === String(raw.id || '').trim());
@@ -144,6 +146,7 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
     if (op === 'drop' && item.state === 'todo') {
       item.state = 'dropped';
       item.note = why || item.note;
+      if (by === 'owner') item.ownerAt = now;
       applied.push(`划掉 ${item.id}「${item.what}」${why ? '：' + why : ''}`);
     } else if (op === 'defer' && item.state === 'todo') {
       // 挪到几点（time）优先；只说时段就挪到那个时段开头（已经过了就不收）
@@ -153,14 +156,17 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
         continue;
       }
       item.at = at;
+      delete item.autoAt;
       item.slot = slotOf(new Date(at).getHours());
       delete item.retryAt;
       item.note = why || item.note;
+      if (by === 'owner') item.ownerAt = now;
       applied.push(`${item.id}「${item.what}」挪到 ${fmtClock(at)}${why ? '：' + why : ''}`);
     } else if (op === 'done' && item.state === 'todo') {
       item.state = 'done';
       item.note = why || item.note;
       item.doneAt = now;
+      if (by === 'owner') item.ownerAt = now;
       applied.push(`${item.id}「${item.what}」算做完了`);
     }
   }
@@ -171,8 +177,14 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
 export function carryCandidates(prev) {
   if (!prev || !Array.isArray(prev.items)) return [];
   return prev.items
-    .filter((x) => x && x.state === 'todo' && !x.at)
-    .map((x) => ({ ...x, age: (Number(x.age) || 0) + 1 }))
+    .filter((x) => x && x.state === 'todo' && (x.from === 'promise' || !x.at || x.autoAt))
+    .map((x) => {
+      const copy = { ...x, age: (Number(x.age) || 0) + 1 };
+      delete copy.at;
+      delete copy.autoAt;
+      delete copy.retryAt;
+      return copy;
+    })
     .filter((x) => x.age <= (CARRY_MAX_AGE[x.from] || 2));
 }
 
@@ -216,28 +228,66 @@ export function mergeOwnerEdits(mine, disk) {
     for (const [k, v] of Object.entries(disk.lifeShown)) merged[k] = Math.max(Number(merged[k]) || 0, Number(v) || 0);
     mine.lifeShown = merged;
   }
+  // 合并定时提醒：支持盘上新增、响过、取消（t.dropped tombstone）以及主人改时间（t.updatedAt 更新）
   const dt = Array.isArray(disk.timers) ? disk.timers : [];
   const mt = Array.isArray(mine.timers) ? mine.timers : [];
   for (const t of dt) {
-    const hit = mt.find((x) => x.id === t.id);
-    if (!hit) mt.push(t);
-    else if (t.fired) hit.fired = true;
+    if (!t || !t.id) continue;
+    const hit = mt.find((x) => x && x.id === t.id);
+    if (!hit) {
+      mt.push({ ...t });
+    } else {
+      if ((Number(t.updatedAt) || 0) > (Number(hit.updatedAt) || 0)) {
+        Object.assign(hit, t);
+      } else {
+        if (t.fired) hit.fired = true;
+        if (t.dropped) { hit.dropped = true; hit.fired = true; }
+      }
+    }
   }
   mine.timers = mt;
+  // 合并日程：除了主人新加的 promise，盘上由主人通过 my_agenda 修改的任何条目（含 self/seen）也一并保留
   const da = disk.agenda && disk.agenda.date === (mine.agenda && mine.agenda.date) ? disk.agenda : null;
-  if (da && Array.isArray(da.items)) {
+  if (da && Array.isArray(da.items) && mine.agenda && Array.isArray(mine.agenda.items)) {
     for (const x of da.items) {
-      if (x.from !== 'promise') continue;
-      const same = mine.agenda.items.find((y) => y.id === x.id);
+      if (!x) continue;
+      const same = mine.agenda.items.find((y) => y && y.id === x.id);
       if (same && same.what === x.what) {
-        if (same.state === 'todo' && x.state !== 'todo') Object.assign(same, { state: x.state, note: x.note });
-        else if (same.state === 'todo' && x.slot !== same.slot) same.slot = x.slot;
+        const ownerUpdated = (Number(x.ownerAt) || 0) > (Number(same.ownerAt) || 0);
+        if (x.from === 'promise' || ownerUpdated) {
+          if (same.state === 'todo' && x.state !== 'todo') {
+            Object.assign(same, { state: x.state, note: x.note, ...(x.doneAt ? { doneAt: x.doneAt } : {}), ...(x.ownerAt ? { ownerAt: x.ownerAt } : {}) });
+          } else if (same.state === 'todo' && (x.slot !== same.slot || x.at !== same.at)) {
+            same.slot = x.slot;
+            if (x.at) same.at = x.at;
+            if (!x.autoAt) delete same.autoAt;
+            if (x.note) same.note = x.note;
+            if (x.ownerAt) same.ownerAt = x.ownerAt;
+          }
+        }
         continue;
       }
-      if (mine.agenda.items.some((y) => y.from === 'promise' && y.what === x.what)) continue;
+      if (x.from !== 'promise') continue;
+      if (mine.agenda.items.some((y) => y && y.from === 'promise' && y.what === x.what)) continue;
       mine.agenda.items.push({ ...x, id: 'a' + mine.agenda.nextId });
       mine.agenda.nextId += 1;
     }
+  }
+  // 合并状态栏、作息、会话整理标记和晚回缓冲，避免后台长耗时存盘覆盖聊天/会话整理刚写入的新值
+  if (disk.customStatus && (Number(disk.customStatus.at) || 0) > (Number(mine.customStatus?.at) || 0)) {
+    mine.customStatus = { ...disk.customStatus };
+  }
+  if (disk.sleepSchedule && (Number(disk.sleepSchedule.at) || 0) > (Number(mine.sleepSchedule?.at) || 0)) {
+    mine.sleepSchedule = { ...disk.sleepSchedule };
+  }
+  if (disk.sessionRolloverDay && (!mine.sessionRolloverDay || String(disk.sessionRolloverDay) > String(mine.sessionRolloverDay))) {
+    mine.sessionRolloverDay = disk.sessionRolloverDay;
+    if (disk.lastRolledSessionId) mine.lastRolledSessionId = disk.lastRolledSessionId;
+  } else if (disk.lastRolledSessionId && !mine.lastRolledSessionId) {
+    mine.lastRolledSessionId = disk.lastRolledSessionId;
+  }
+  if (disk.held && typeof disk.held === 'object') {
+    mine.held = { ...disk.held };
   }
   return mine;
 }
@@ -252,12 +302,12 @@ export function agendaBlock(agenda, { hour = new Date().getHours(), timers = [],
     if (agenda.theme) lines.push(`今天大概想：${agenda.theme}`);
     for (const x of agenda.items) lines.push(itemLine(x, cur));
   }
-  const pendingTimers = (timers || []).filter((t) => !t.fired && t.at > now);
+  const pendingTimers = (timers || []).filter((t) => t && !t.fired && !t.dropped && t.at > now);
   for (const t of pendingTimers) {
     const when = new Date(t.at).toDateString() === new Date(now).toDateString() ? fmtClock(t.at) : `${new Date(t.at).getMonth() + 1}/${new Date(t.at).getDate()} ${fmtClock(t.at)}`;
     lines.push(t.kind === 'followup'
-      ? `- 惦记着：${when} 去问问他「${t.what}」（到点系统会叫你）`
-      : `- 定好的：${when} ${t.what}（到点系统会叫你，不用自己盯）`);
+      ? `- [${t.id}] 惦记着：${when} 去问问他「${t.what}」（到点系统会叫你）`
+      : `- [${t.id}] 定好的：${when} ${t.what}（到点系统会叫你，不用自己盯）`);
   }
   const open = agenda ? agenda.items.filter((x) => x.state === 'todo' && x.slot === cur) : [];
   lines.push(`现在是${SLOT_LABEL[cur]}。${open.length ? `这个时段还没做的：${open.map((x) => x.id).join('、')}。` : '这个时段没有排着的事。'}`);
@@ -312,9 +362,10 @@ export function parseJsonLoose(text) {
 
 /**
  * 「哪天 + 几点」→ 时间戳。day = 0 今天、1 明天……；time 可空。
- * 没给时间的跟进默认那天晚上 8 点（今天已经过了 8 点就一个半小时后）；看不懂返回 0。
+ * 没给时间时优先按 slot 选默认小时（morning→9、afternoon→14、evening→20、night→22），都没给默认晚上 8 点；看不懂返回 0。
  */
-export function parseWhen(timeText, day = 0, { now = Date.now(), defaultHour = 20 } = {}) {
+const SLOT_DEFAULT_HOUR = { morning: 9, afternoon: 14, evening: 20, night: 22 };
+export function parseWhen(timeText, day = 0, { now = Date.now(), defaultHour = 20, slot = '' } = {}) {
   const d0 = Math.max(0, Math.min(14, Math.round(Number(day) || 0)));
   const t = String(timeText || '').trim();
   let at = 0;
@@ -330,9 +381,11 @@ export function parseWhen(timeText, day = 0, { now = Date.now(), defaultHour = 2
     }
     return at;
   }
+  const slotKey = String(slot || '').trim().toLowerCase();
+  const h = Object.prototype.hasOwnProperty.call(SLOT_DEFAULT_HOUR, slotKey) ? SLOT_DEFAULT_HOUR[slotKey] : defaultHour;
   const d = new Date(now);
   d.setDate(d.getDate() + d0);
-  d.setHours(defaultHour, 0, 0, 0);
+  d.setHours(h, 0, 0, 0);
   if (d.getTime() <= now) return now + 90 * 60_000;
   return d.getTime();
 }
@@ -484,6 +537,7 @@ export function ensureTimes(agenda, { now = Date.now() } = {}) {
     let t = Math.max(cursor[x.slot] || slotStartToday(x.slot, now) || 0, now + 5 * 60_000);
     for (let i = 0; i < 24 && !free(t, mins); i++) t += 20 * 60_000;
     x.at = t;
+    x.autoAt = true;
     taken.push([t, t + mins * 60_000]);
     cursor[x.slot] = t + (mins + 15) * 60_000;
   }
