@@ -624,6 +624,7 @@ export default {
       const keepProject = s.project;
       const keepOuting = s.outing && s.outing.returnAt > Date.now() - 6 * 3600_000 ? s.outing : null;
       const keepSleepSchedule = s.sleepSchedule && Number(s.sleepSchedule.wakeAt) > Date.now() - 6 * 3600_000 ? s.sleepSchedule : null;
+      const keepBedtimeForSleepAt = Number(s.bedtimeForSleepAt) > Date.now() - 12 * 3600_000 ? Number(s.bedtimeForSleepAt) : 0;
       const keepCustomStatus = s.customStatus && typeof s.customStatus === 'object' ? s.customStatus : null;
       const keepCustom = s.customActions;
       const keepFails = { streak: (s.fails && s.fails.streak) || {}, until: (s.fails && s.fails.until) || {} };
@@ -658,7 +659,8 @@ export default {
         Object.assign(s, emptyState());
         s.project = keepProject || null;
         s.outing = keepOuting;
-        if (keepSleepSchedule) s.sleepSchedule = keepSleepSchedule;
+        s.sleepSchedule = keepSleepSchedule;
+        if (keepBedtimeForSleepAt) s.bedtimeForSleepAt = keepBedtimeForSleepAt;
         if (keepCustomStatus) s.customStatus = keepCustomStatus;
         s.customActions = keepCustom && typeof keepCustom === 'object' ? keepCustom : {};
         s.fails = keepFails;
@@ -697,7 +699,8 @@ export default {
           status = 'idle';
           text = (s.customStatus && s.customStatus.sleepText) || '💤 睡着了';
         } else if (s.outing && s.outing.returnAt > now) {
-          text = (s.busy && s.busy.status) || (s.customStatus && s.customStatus.text) || `${s.outing.place || s.outing.what || '出门溜达中'}`;
+          const placeName = typeof s.outing.place === 'string' ? s.outing.place : (s.outing.place && s.outing.place.name) || '';
+          text = (s.busy && s.busy.status) || (s.customStatus && s.customStatus.text) || `${placeName || s.outing.what || '出门溜达中'}`;
         } else if (s.busy && s.busy.until > now && (s.busy.status || s.busy.what)) {
           text = clip(s.busy.status || (s.customStatus && s.customStatus.text) || s.busy.what, 48);
         } else if (s.customStatus && s.customStatus.text) {
@@ -2322,10 +2325,7 @@ export default {
 
       const s = load();
       const hour = new Date().getHours();
-      const from = Number(c.awakeFrom) || 0;
-      const to = Number(c.awakeTo) || 24;
-      const awake = from <= to ? hour >= from && hour < to : hour >= from || hour < to;
-      if (!awake) {
+      if (!isAwakeHour(c)) {
         s.nextWakeAt = Date.now() + 45 * 60_000;
         save(s);
         return { ok: false, message: '不在活跃时段' };
@@ -2344,6 +2344,7 @@ export default {
         } catch (error) {
           api.log.warn('自主生活：定计划出错 ' + error.message);
         }
+        mergeOwnerEdits(s, readJson(stateFile(), null));
         save(s);
         // 没排成（模型没回 / 网络不通）：15 分钟后再排，这一轮不做别的
         if (!s.agenda.planned) {
@@ -2775,7 +2776,10 @@ export default {
         const hadEnergy = s.energy && s.energy.day === dayKey();
         ensureEnergy(s, c);
         const wChanged = await refreshWeather(s);
-        if (wChanged || (!hadEnergy && s.energy)) save(s);
+        if (wChanged || (!hadEnergy && s.energy)) {
+          mergeOwnerEdits(s, readJson(stateFile(), null));
+          save(s);
+        }
       }
       // 生活小事忙完了：补一句做得怎么样（先于下一件到点的事）
       try {
@@ -2805,15 +2809,20 @@ export default {
           mergeOwnerEdits(s, readJson(stateFile(), null));
           save(s);
         }
-        if (await tickPendingShare(s)) save(s);
+        if (await tickPendingShare(s)) {
+          mergeOwnerEdits(s, readJson(stateFile(), null));
+          save(s);
+        }
       } catch (error) {
         api.log.warn('自主生活：发出门照片出错 ' + error.message);
       }
-      // 睡前例行：离睡觉不到 40 分钟、今天还没走过这一步
+      // 睡前例行：离睡觉不到 40 分钟、且针对这一次 sleepAt 还没走过（防跨午夜 00:01 重跑）
       if (isAwakeHour(c) && s.bedtimeDay !== dayKey()) {
         const sleepAt = nextSleepAt(c);
-        if (sleepAt && sleepAt - Date.now() <= 40 * 60_000) {
+        if (sleepAt && sleepAt - Date.now() <= 40 * 60_000 && Number(s.bedtimeForSleepAt) !== sleepAt) {
           s.bedtimeDay = dayKey();
+          s.bedtimeForSleepAt = sleepAt;
+          mergeOwnerEdits(s, readJson(stateFile(), null));
           save(s);
           waking = true;
           try {
@@ -2828,7 +2837,9 @@ export default {
       }
       // 方案 B：睡后或次日开机补做会话整理归档（避开 DSH 80% 英文代码压缩）
       try {
-        await maybeRolloverSessions(s, c);
+        if (await maybeRolloverSessions(s, c)) {
+          mergeOwnerEdits(s, readJson(stateFile(), null));
+        }
       } catch (error) {
         api.log.warn('自主生活：睡后整理会话出错 ' + error.message);
       }
@@ -3411,6 +3422,7 @@ export default {
       }
       s.busy = { since: Date.now(), until: sleepAt, what: '洗漱准备睡觉' };
       s.nextWakeAt = nextAwakeAt(c, sleepAt) + randMin(0, 30);
+      mergeOwnerEdits(s, readJson(stateFile(), null));
       save(s);
       appendLog({ at: Date.now(), action: 'bedtime', why: '快到睡觉时间了', detail: '', note });
       api.log.info(`自主生活：睡前 —— ${note}（明早 ${clock(s.nextWakeAt)} 左右醒）`);
@@ -3561,8 +3573,7 @@ export default {
         api.log.warn('自主生活：写生活小结失败 ' + error.message);
       }
       if (nextStatus) {
-        s.customStatus = { text: nextStatus, at: now };
-        save(s);
+        s.customStatus = { text: nextStatus, at: Date.now() };
       }
       const note = recap ? clip(`${item.what}，${recap}`, 90) : item.what;
       if (recap) item.note = clip(recap, 60);

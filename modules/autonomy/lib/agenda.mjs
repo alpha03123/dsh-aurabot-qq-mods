@@ -286,6 +286,13 @@ export function mergeOwnerEdits(mine, disk) {
   } else if (disk.lastRolledSessionId && !mine.lastRolledSessionId) {
     mine.lastRolledSessionId = disk.lastRolledSessionId;
   }
+  if (disk.groupRolloverDays && typeof disk.groupRolloverDays === 'object') {
+    const merged = { ...(mine.groupRolloverDays || {}) };
+    for (const [k, v] of Object.entries(disk.groupRolloverDays)) {
+      if (v && (!merged[k] || String(v) > String(merged[k]))) merged[k] = v;
+    }
+    mine.groupRolloverDays = merged;
+  }
   if (disk.held && typeof disk.held === 'object') {
     mine.held = { ...disk.held };
   }
@@ -327,8 +334,8 @@ export function fmtClock(ts) {
   return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
 }
 
-/** 「22:00」「晚上10点」「10点半」→ 今天或明天的时间戳；看不懂返回 0 */
-export function parseClockToday(text, now = Date.now()) {
+/** 解析「22:00」「晚上10点」「8点半」→ { h, m }；看不懂返回 null */
+function parseClockHM(text) {
   const s = String(text || '').trim();
   let h;
   let m = 0;
@@ -341,10 +348,17 @@ export function parseClockToday(text, now = Date.now()) {
     m = mm[3] === '半' ? 30 : Number(mm[4]) || 0;
     if (/下午|傍晚|晚上|夜里/.test(mm[1] || '') && h < 12) h += 12;
     if (mm[1] === '中午' && h < 6) h += 12;
-  } else return 0;
-  if (!(h >= 0 && h < 24 && m >= 0 && m < 60)) return 0;
+  } else return null;
+  if (!(h >= 0 && h < 24 && m >= 0 && m < 60)) return null;
+  return { h, m };
+}
+
+/** 「22:00」「晚上10点」「10点半」→ 今天或明天的时间戳；看不懂返回 0 */
+export function parseClockToday(text, now = Date.now()) {
+  const hm = parseClockHM(text);
+  if (!hm) return 0;
   const d = new Date(now);
-  d.setHours(h, m, 0, 0);
+  d.setHours(hm.h, hm.m, 0, 0);
   if (d.getTime() <= now) d.setDate(d.getDate() + 1);
   return d.getTime();
 }
@@ -381,7 +395,7 @@ export function parseWhen(timeText, day = 0, { now = Date.now(), defaultHour = 2
     }
     return at;
   }
-  const slotKey = String(slot || '').trim().toLowerCase();
+  const slotKey = normSlot(slot, '');
   const h = Object.prototype.hasOwnProperty.call(SLOT_DEFAULT_HOUR, slotKey) ? SLOT_DEFAULT_HOUR[slotKey] : defaultHour;
   const d = new Date(now);
   d.setDate(d.getDate() + d0);
@@ -502,15 +516,12 @@ export function energyDelta(action) {
 // 每条安排都有个开始时间（at）：到点了才叫决策层为这一条想一下。没写时间的（老数据、加进来的）按时段补一个。
 export const SLOT_START_MIN = { morning: 9 * 60 + 30, afternoon: 14 * 60, evening: 19 * 60, night: 22 * 60 };
 
-/** 「21:00」→ 今天这个点的时间戳；格式不对、或者已经过去 5 分钟以上 → 0 */
+/** 「21:00」「晚上9点」「8点半」→ 今天这个点的时间戳；格式不对、或者已经过去 5 分钟以上 → 0 */
 export function clockToday(text, now = Date.now()) {
-  const m = String(text || '').trim().match(/^(\d{1,2})[:：](\d{2})$/);
-  if (!m) return 0;
-  const h = Number(m[1]);
-  const mi = Number(m[2]);
-  if (!(h >= 0 && h < 24 && mi >= 0 && mi < 60)) return 0;
+  const hm = parseClockHM(text);
+  if (!hm) return 0;
   const d = new Date(now);
-  d.setHours(h, mi, 0, 0);
+  d.setHours(hm.h, hm.m, 0, 0);
   return d.getTime() < now - 5 * 60_000 ? 0 : d.getTime();
 }
 

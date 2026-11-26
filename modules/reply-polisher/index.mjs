@@ -168,7 +168,7 @@ export default {
       }
 
       const ut = String(userText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-      if (ut) {
+      if (ut && !/^【(系统提醒|系统提示|当前背景|今天做过的事|上次聊天的延续)/.test(ut)) {
         const last = lines[lines.length - 1] || '';
         if (!last.includes(ut)) {
           lines.push(`${inGroup ? '群友' : '用户'}：${ut}`);
@@ -206,7 +206,7 @@ export default {
       const userPrompt = `【场景】\n${scene}\n【风格卡】\n${styleCard}\n【最近对话】\n${recent}\n【待润色草稿】\n${cleanDraft}`;
 
       const baseUrl = String(c.baseUrl || 'http://127.0.0.1:11434').replace(/\/+$/, '');
-      const timeoutMs = Math.max(1500, Math.min(30000, Number(c.timeoutMs) || 8000));
+      const timeoutMs = Math.max(1500, Math.min(60000, Number(c.timeoutMs) || 8000));
       const t0 = Date.now();
 
       try {
