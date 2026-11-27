@@ -1,3 +1,4 @@
+// [未启用/备用 · ADB 控安卓手机链路，线上未开启 phone 扩展时仅保留作备用]
 // 手机 ADB 唤醒、安全执行与自建模块扫描（从 autonomy/index.mjs 拆出）。
 import fs from 'node:fs';
 import path from 'node:path';
