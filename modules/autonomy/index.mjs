@@ -144,6 +144,7 @@ export default {
     weatherLon: 121.544,
     // 本地改：出门（真实地点）。家的位置用 WGS84 经纬度；高德 key 没填就只用 OSM
     outingEnabled: false,
+    outingSharePhoto: false,
     webSearch: 'deepseek',
     homeName: '',
     homeLat: '',
@@ -158,6 +159,7 @@ export default {
     { key: 'weatherLon', label: '经度（可留空自动查）', type: 'number' },
     { key: 'webSearch', label: '上网查东西用什么', type: 'select', options: [{ value: 'deepseek', label: 'DeepSeek 联网搜索（搜索和读网页都在 DeepSeek 那边，回来总结 + 来源）' }, { value: 'browser', label: 'Bing + 专用浏览器（要开 browser-ops）' }], hint: '用 DSH 里存的 DeepSeek key（和 DSH 自己的联网搜索同一把），每次大约 1 万输入 token；不开浏览器，也不会给她发网页图片。' },
     { key: 'outingEnabled', label: '允许她出门（去附近真实的店 / 公园）', type: 'switch', hint: '要先填下面「住的地方」的经纬度。地点来自高德（填了 key 时）或 OpenStreetMap；店里的经历由模型按真实店名、距离、天气来写。' },
+    { key: 'outingSharePhoto', label: '出门回来主动发地图照片', type: 'switch', hint: '默认关闭：关闭后她仍会正常出门、写经历，也可以纯文字聊起，只是不再把地图 POI 照片发到聊天里。' },
     { key: 'homeName', label: '住的地方（给她看的名字，比如「月湖边上」）', type: 'text', hint: '别填真实住址，选一片街区 / 商圈就好——她会在聊天里提到去过的地方' },
     { key: 'homeLat', label: '住处纬度（WGS84）', type: 'number' },
     { key: 'homeLon', label: '住处经度（WGS84）', type: 'number' },
@@ -252,6 +254,11 @@ export default {
       try {
         const mem = api.use('memory');
         if (!mem) return [];
+        // LLM Wiki 正式模式：直读常驻 Wiki（认识/主人 + 认识/近期与约定 + 我），不再查旧碎片 SQLite
+        if (api.config().memory?.wikiMode === 'active' && typeof mem.wiki?.residentText === 'function') {
+          const res = mem.wiki.residentText();
+          return res && res.text ? [res.text] : [];
+        }
         // 按今天的每一件事分别去想，再轮流各取一两条：拼成一句去搜的话，安排里出现最多的话题会占满（11-19 六条全是蛋糕）
         const parts = (Array.isArray(query) ? query : [query])
           .map((x) => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 120))
@@ -1388,11 +1395,10 @@ export default {
           }
         } catch (error) {}
       }
-      // 手机上做的活动也写进记忆库，这样 QQ 上聊起来能接上
-      // 节流 20 分钟：她一天醒上百次，不节流会把记忆库灌爆
+      // 手机上做的活动：仅在非 LLM Wiki active 模式下写旧库（active 模式下由 activity.jsonl 直供睡后 Dreaming）
       const isVmAction =
         d.action === 'draw' || d.action === 'phone';
-      if (isVmAction && !(result.extra && result.extra.ok === false) && Date.now() - (s.lastMemoAt || 0) > 20 * 60_000) {
+      if (api.config().memory?.wikiMode !== 'active' && isVmAction && !(result.extra && result.extra.ok === false) && Date.now() - (s.lastMemoAt || 0) > 20 * 60_000) {
         try {
           const mem = api.use('memory');
           if (mem && typeof mem.add === 'function') {

@@ -178,10 +178,6 @@ export function createLifeTick({
         d0.note = note;
         d0.brief = clip(recap, AUTO_LIMITS.DONE_BRIEF);
       }
-      try {
-        const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: clip(note, AUTO_LIMITS.EVENT_MEM), tags: ['自主生活', '生活'], importance: 0.3 });
-      } catch (error) {}
       if (recap) appendLog({ at: now, action: 'life-recap', why: item.what, detail: '', note: recap, agendaId: item.id });
       api.log.info(`自主生活：${item.what} 忙完了${recap ? ' —— ' + recap : ''}`);
       return true;

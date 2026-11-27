@@ -79,11 +79,7 @@ export function createDiaryFlow({ api, cfg, ask, clock, ymd, ownerOf, ownerChatL
       } catch (error) {
         return { note: `想写日记，没存下来：${error.message}`, extra: { ok: false } };
       }
-      // 记忆里只记「写了日记」，不记内容：日记是私密的，不该被聊天时的记忆召回带出来
-      try {
-        const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: '写了一篇只给自己看的日记', tags: ['自主生活', '日记'], importance: 0.3 });
-      } catch (error) {}
+      // 私密日记不再写入旧记忆库（见计划 4.4）
       return { note: '写了一篇只给自己看的日记', extra: { ok: true, life: false } };
     }
 

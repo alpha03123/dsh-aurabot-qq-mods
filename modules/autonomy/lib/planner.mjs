@@ -103,11 +103,7 @@ export function createPlanner({
         ].filter(Boolean).join('\n');
       })(),
       '',
-      memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
-      (() => {
-        const last = diaryRecent(1)[0];
-        return last ? `你上一篇日记（${last.day} ${last.time}）写过：${clip(last.text, AUTO_LIMITS.DIARY_EXCERPT)}` : '';
-      })(),
+      memHints.length ? `你的长期记忆与近期约定：\n${memHints.join('\n')}` : '',
       chat.length ? `最近和${owner}的私聊：\n${chat.join('\n')}` : `最近没和${owner}私聊。`,
       mood ? `你现在的心情：${mood}` : '',
       (() => { ensureEnergy(s, c); return s.energy ? `你今天起来的状态：${energyLabel(energyNow(s))}${energyNow(s) < 50 ? '（没睡好，少排点）' : ''}` : ''; })(),

@@ -129,10 +129,6 @@ export function createOutingFlow({
           await h.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: `【系统提醒，不是${name}说的话】你刚出门去了${p.place}，回来把地图上这家店的照片发给了${name}（${p.what}）。这趟是这样的：${clip(p.story, AUTO_LIMITS.OUTING_STORY)}。用你自己的口气配一两句，像随手分享，别说"我给你发了张图"。这张其实是地图上这家店的图：不用主动说明来源，${name}问起是不是你拍的，就照实说是地图上找的。` }], '');
         }
       } catch (error) {}
-      try {
-        const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: `把${p.place}的照片发给主人看了（是地图上这家店的图，不是自己拍的）`, tags: ['自主生活', '出门'], importance: 0.3 });
-      } catch (error) {}
       appendLog({ at: Date.now(), action: 'share', why: '出门回来', detail: p.place, note: `发了${p.place}的照片：${p.what}` });
       api.log.info(`自主生活：出门回来，把${p.place}的照片发给了主人（${p.what}）`);
       return true;
@@ -141,7 +137,7 @@ export function createOutingFlow({
     async function tickPendingShare(s) {
       const p = s.pendingShare;
       if (!p || Date.now() < p.at) return false;
-      if (Date.now() - p.at > 3 * 3600_000 || !isAwakeHour(cfg())) {
+      if (cfg().outingSharePhoto !== true || Date.now() - p.at > 3 * 3600_000 || !isAwakeHour(cfg())) {
         s.pendingShare = null;
         return true;
       }
@@ -313,12 +309,8 @@ export function createOutingFlow({
         d0.note = note;
         d0.brief = clip(st.story || note, AUTO_LIMITS.DONE_BRIEF);
       }
-      try {
-        const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function' && st.story) mem.addEvent({ text: clip(`去了${p.name}：${st.story}`, AUTO_LIMITS.EVENT_MEM), tags: ['自主生活', '生活', '出门'], importance: 0.4 });
-      } catch (error) {}
       s.lastOuting = { day: dayKey(), name: p.name, type: p.type, photoFile: o.photoFile, photoWhat: st.photoWhat, photoOk: st.photoOk, story: st.story, backAt: Date.now() };
-      if (st.share && o.photoFile && !s.pendingShare) {
+      if (cfg().outingSharePhoto === true && st.share && o.photoFile && !s.pendingShare) {
         s.pendingShare = { at: Date.now(), file: o.photoFile, place: p.name, what: st.photoWhat || '这家店', story: st.story };
       } else if (st.share && st.story && canReachOwnerNow(s)) {
         try {
