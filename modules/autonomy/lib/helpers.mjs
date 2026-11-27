@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { clip, normSlot, parseJsonLoose, selfReport } from './agenda.mjs';
+import { AUTO_LIMITS } from './limits.mjs';
 
 export function readJson(file, fallback) {
   let raw;
@@ -58,7 +59,7 @@ export function findingsBlock(s) {
     const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     return d.toDateString() === new Date().toDateString() ? `今天 ${hm}` : `${d.getMonth() + 1}月${d.getDate()}日 ${hm}`;
   };
-  return `【你之前查到过的】（B 站 / 上网真找到的要点）\n${list.map((x) => `- ${when(x.at)}${x.topic ? `〔${x.topic}〕` : ''}${x.query ? `搜「${x.query}」` : ''}：${String(x.text).slice(0, 260)}`).join('\n')}`;
+  return `【你之前查到过的】（B 站 / 上网真找到的要点）\n${list.map((x) => `- ${when(x.at)}${x.topic ? `〔${x.topic}〕` : ''}${x.query ? `搜「${x.query}」` : ''}：${String(x.text).slice(0, AUTO_LIMITS.FINDING_SHOWN)}`).join('\n')}`;
 }
 /** 有专用执行器的动作；不在这里的动作发布版只记录、不执行 */
 export const STANDARD_ACTIONS = new Set(ACTIONS);
@@ -219,8 +220,8 @@ export function parseDecision(out) {
     : [];
   return {
     action,
-    why: String(j.why || '').slice(0, 60),
-    detail: String(j.detail || '').slice(0, 1500),
+    why: String(j.why || '').slice(0, AUTO_LIMITS.AGENDA_WHY),
+    detail: String(j.detail || '').slice(0, AUTO_LIMITS.EXEC_OUTPUT),
     steps,
     kind: String(j.kind || '')
       .trim()
@@ -233,11 +234,11 @@ export function parseDecision(out) {
     // 这一轮做完算不算把那条做完了：只是为它查资料、做准备的写 false（没写当作 true，兼容旧输出）
     agendaDone: !(j.agendaDone === false || String(j.agendaDone).trim().toLowerCase() === 'false'),
     // 这件事说的是什么（几个字的话题名），代码只拿来数「最近同一件事做了几轮」
-    topic: String(j.topic || '').replace(/[\s「」『』"“”]/g, '').slice(0, 12),
+    topic: String(j.topic || '').replace(/[\s「」『』"“”]/g, '').slice(0, 24),
     // web 用：拿去搜索引擎搜的关键词（不再拿 detail 那句话截断去搜）
-    query: String(j.query || '').replace(/\s+/g, ' ').trim().slice(0, 40),
+    query: String(j.query || '').replace(/\s+/g, ' ').trim().slice(0, AUTO_LIMITS.FINDING_QUERY),
     // outing 用：想去什么样的地方（她自己写，比如「能翻食谱的书店」「江边」）；地图搜索词放 query
-    place: String(j.place || '').replace(/\s+/g, ' ').trim().slice(0, 30),
+    place: String(j.place || '').replace(/\s+/g, ' ').trim().slice(0, AUTO_LIMITS.OUTING_PLACE),
     ops: Array.isArray(j.ops) ? j.ops.filter((o) => o && typeof o === 'object').slice(0, 3) : [],
     // 这件事本身：要忙多久、中途能不能放下、做完精力怎么变（她自己报，没写就是 null）
     ...selfReport(j),

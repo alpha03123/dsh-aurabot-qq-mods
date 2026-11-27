@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { clip } from './agenda.mjs';
+import { AUTO_LIMITS } from './limits.mjs';
 
 export function createDiaryFlow({ api, cfg, ask, clock, ymd, ownerOf, ownerChatLines, seenSince, moodLine, styleHint }) {
     // ── 日记：只记在本地（modules-data/autonomy/diary/日期.md），不发空间 ─────────
@@ -49,7 +50,7 @@ export function createDiaryFlow({ api, cfg, ask, clock, ymd, ownerOf, ownerChatL
         did.length ? `今天做过的事：\n${did.join('\n')}` : '',
         chat.length ? `今天和${owner}聊过：\n${chat.join('\n')}` : `今天没怎么和${owner}说话。`,
         mood ? `你现在的心情：${mood}` : '',
-        before ? `上一篇日记（${before.day} ${before.time}）开头：${clip(before.text, 60)}` : '',
+        before ? `上一篇日记（${before.day} ${before.time}）：${clip(before.text, AUTO_LIMITS.DIARY_EXCERPT)}` : '',
         '',
         '用你自己的口气写，100~300 字，第一人称。挑一两件真正在意的事写，别流水账、别总结升华、别写给谁看的那种腔调；没写完的心思可以就那么停着。只输出日记正文。',
       ]
@@ -70,7 +71,7 @@ export function createDiaryFlow({ api, cfg, ask, clock, ymd, ownerOf, ownerChatL
           return { note: `想写日记，没写成：${error.message}`, extra: { ok: false } };
         }
       }
-      body = String(body).replace(/^```[a-z]*\n?|```$/g, '').trim().slice(0, 1500);
+      body = String(body).replace(/^```[a-z]*\n?|```$/g, '').trim().slice(0, AUTO_LIMITS.DIARY_BODY);
       if (!body || /^[{\[]/.test(body)) return { note: '想写日记，憋了半天没写出来', extra: { ok: false } };
       try {
         fs.mkdirSync(diaryDir(), { recursive: true });

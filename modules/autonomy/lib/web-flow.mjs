@@ -1,5 +1,6 @@
 // 上网搜索与正文读取流程：DeepSeek 联网搜索 / 浏览器搜索 / web-read 归纳与记忆落库。
 import { clip, parseJsonLoose } from './agenda.mjs';
+import { AUTO_LIMITS } from './limits.mjs';
 import { SEARCH_BASE_URL, SEARCH_MODEL, buildSearchBody, parseSearchResponse, searchPageText } from './websearch.mjs';
 
 export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImage, pageImages }) {
@@ -34,10 +35,10 @@ export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImag
             }
             if (best && bestLen >= 200) node = best;
           }
-          return { title: document.title, text: clean((node || document.body || {}).innerText).slice(0, 4000) };
+          return { title: document.title, text: clean((node || document.body || {}).innerText).slice(0, ${AUTO_LIMITS.WEB_PAGE}) };
         })()`, 15000);
         const text = String((r && r.text) || '').trim();
-        return text ? `页面：${clip(String((r && r.title) || ''), 80)}\n正文：${text}` : '';
+        return text ? `页面：${clip(String((r && r.title) || ''), AUTO_LIMITS.WEB_TITLE)}\n正文：${text}` : '';
       } catch (error) {
         api.log.warn('自主生活：读正文失败，退回页面快照 ' + error.message);
         return '';
@@ -61,8 +62,8 @@ export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImag
 
     async function browseWeb(d, s) {
       // want 是她想弄明白的事（给读页面用），topic 是真正拿去搜的关键词
-      const want = clip(d.detail || d.why, 80) || '最近有什么好玩的';
-      const topic = clip(d.query, 40) || clip(d.detail || d.why, 40) || '最近有什么好玩的';
+      const want = clip(d.detail || d.why, AUTO_LIMITS.FINDING_QUERY) || '最近有什么好玩的';
+      const topic = clip(d.query, AUTO_LIMITS.FINDING_QUERY) || clip(d.detail || d.why, AUTO_LIMITS.FINDING_QUERY) || '最近有什么好玩的';
       const timeoutMs = Math.max(20, Number(cfg().askTimeoutSec) || 75) * 1000;
       const r = webMode() === 'browser' ? await searchByBrowser(want, topic, s, timeoutMs) : await searchByDeepSeek(want, topic);
       if (r.fail) return r.fail;
@@ -74,7 +75,7 @@ export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImag
       try {
         const out = await ask(api.dsh, { key: 'web-pick', cfg: api.config(),
           system: '你在网上查东西，只输出 JSON。',
-          text: `你想查：${want}\n下面是搜索结果（→ 后面是链接）：\n${clip(listText, 2500)}\n${webBlockedText(s) ? `\n这些网站最近打不开：${webBlockedText(s)}\n` : ''}\n挑你最想点开的结果，按想看的顺序最多 ${n} 条，回 {"urls":["完整链接"]}；都没意思就回 {"urls":[]}。`,
+          text: `你想查：${want}\n下面是搜索结果（→ 后面是链接）：\n${clip(listText, AUTO_LIMITS.WEB_LIST)}\n${webBlockedText(s) ? `\n这些网站最近打不开：${webBlockedText(s)}\n` : ''}\n挑你最想点开的结果，按想看的顺序最多 ${n} 条，回 {"urls":["完整链接"]}；都没意思就回 {"urls":[]}。`,
           maxTokens: 300,
           temperature: 0.7,
           timeoutMs,
@@ -169,8 +170,8 @@ export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImag
         const todayStr = new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
         const out = await ask(api.dsh, { key: 'web-read', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚在网上看了点东西。只输出 JSON。',
-          text: `今天是 ${todayStr}。\n你本来想查：${want}\n你看到的${label || (opened ? `页面（${hostOf(link)}）` : '（没点开任何一条，这是搜索结果列表本身）')}：\n${clip(page, 3000)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}${x.w && x.h ? `（${x.w}×${x.h}）` : ''}`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），40 字以内，别写「一篇文章」「一些推荐」这种笼统的；如果查到的展览或活动结束日期早于今天，务必注明已结束","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
-          maxTokens: 600,
+          text: `今天是 ${todayStr}。\n你本来想查：${want}\n你看到的${label || (opened ? `页面（${hostOf(link)}）` : '（没点开任何一条，这是搜索结果列表本身）')}：\n${clip(page, AUTO_LIMITS.WEB_PAGE)}\n${images.length && s && canShareImage(s) ? `\n页面上的图（只有说明，你还没看到图本身）：\n${images.map((x, i) => `[${i + 1}] ${x.alt || '（没有说明）'}${x.w && x.h ? `（${x.w}×${x.h}）` : ''}`).join('\n')}\n如果有一张你很想拿给${ownerOf().name}看，在 image 里写它的编号，没有就写 0。\n` : ''}\n用你自己的口气回：{"got":"found / missed / blocked 三选一：found 找到了想要的；missed 页面打开了但没有你要的（比如只有一串链接、讲的是别的）；blocked 网站没给看（滑块验证、要登录、拦截页）","image":0,"saw":"具体看到了什么：说出具体的名字、东西或说法（片名、菜名、一句让你记住的话），别写「一篇文章」「一些推荐」这种笼统的；如果查到的展览或活动结束日期早于今天，务必注明已结束","feeling":"一句你的感受","share":"想之后跟${ownerOf().name}聊这个就写一句由头，不想就空字符串"}`,
+          maxTokens: 1000,
           temperature: 0.9,
           timeoutMs,
         });
@@ -187,9 +188,9 @@ export function createWebFlow({ api, cfg, ask, ownerOf, canShareImage, shareImag
       }
       // 读页面那一步没出结果：如实记成没读成，不当成查到了
       if (!j.got && !j.saw) return { note: `上网查「${topic}」：页面打开了，但没读成`, extra: { ok: false, later: true, output: link } };
-      const saw = clip(j.saw, 40) || clip(title, 40) || `搜了搜「${topic}」`;
-      const feeling = clip(j.feeling, 40);
-      const share = clip(j.share, 40);
+      const saw = clip(j.saw, AUTO_LIMITS.WEB_SAW) || clip(title, AUTO_LIMITS.WEB_TITLE) || `搜了搜「${topic}」`;
+      const feeling = clip(j.feeling, AUTO_LIMITS.WEB_SAW);
+      const share = clip(j.share, AUTO_LIMITS.WEB_SAW);
       const got = ['found', 'missed', 'blocked'].includes(String(j.got || '').trim()) ? String(j.got).trim() : 'found';
       // 没拿到想要的：如实记成没查到 / 打不开，不算做成（later：不算动作坏了，不触发停用一天），也不记成「看过」
       if (got === 'blocked') {

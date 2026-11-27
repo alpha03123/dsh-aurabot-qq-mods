@@ -1,5 +1,6 @@
 // 日常后台节拍：睡前例行、精力与心情、天气刷新、到点生活小事与生活小结。
 import { clip, parseJsonLoose, busyMinutes, energyAt, energyLabel, energyDelta, parseWeather, weatherLine, isWet } from './agenda.mjs';
+import { AUTO_LIMITS } from './limits.mjs';
 import { isGranted } from './grants.mjs';
 import { mergeOwnerEdits } from './agenda.mjs';
 import { readJson } from './helpers.mjs';
@@ -115,12 +116,12 @@ export function createLifeTick({
       item.state = 'done';
       item.note = item.what;
       item.doneAt = now;
-      const stText = clip(item.status || item.what, 36);
+      const stText = clip(item.status || item.what, AUTO_LIMITS.STATUS_BAR);
       if (stText) s.customStatus = { text: stText, at: now };
       s.busy = { since: now, until: now + mins * 60_000, what: item.what, canPause: item.canPause != null ? item.canPause : null, ...(stText ? { status: stText } : {}) };
       addEnergy(s, item.energy != null ? item.energy : energyDelta(item.action || 'life'));
       if (!s.nextWakeAt || s.nextWakeAt < s.busy.until) s.nextWakeAt = s.busy.until + randMin(2, 10);
-      s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id, why: String(item.why || '').slice(0, 60) }, ...(s.done || [])].slice(0, 50);
+      s.done = [{ at: now, action: item.action || 'life', note: item.what, brief: item.what, dry: false, kind: 'other', agendaId: item.id, why: String(item.why || '').slice(0, AUTO_LIMITS.AGENDA_WHY) }, ...(s.done || [])].slice(0, 50);
       // 做得怎么样等忙完再写（tickLifeRecaps），记忆也那时候再进
       item.recapAt = s.busy.until;
       appendLog({ at: now, action: item.action || 'life', why: '安排里定了这个点', detail: '', note: item.what, agendaId: item.id });
@@ -140,7 +141,7 @@ export function createLifeTick({
         .filter((x) => x && !x.dry && Number(x.at) < startAt && startAt - Number(x.at) <= 3 * 3600_000)
         .slice(0, 5)
         .reverse()
-        .map((x) => `${clock(x.at)} ${clip(x.note || x.brief || x.action, 80)}`);
+        .map((x) => `${clock(x.at)} ${clip(x.note || x.brief || x.action, AUTO_LIMITS.LIFELOG_LINE)}`);
       const text = [
         `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚忙完：${item.what}（${clock(startAt)} 开始${item.why ? `，当时想的是：${item.why}` : ''}）。`,
         before.length ? `这之前做过：\n${before.join('\n')}` : '',
@@ -162,24 +163,24 @@ export function createLifeTick({
           timeoutMs: Math.max(20, Number(c.askTimeoutSec) || 75) * 1000,
         });
         const j = parseJsonLoose(out);
-        recap = clip((j && j.note) || '', 60);
-        nextStatus = clip((j && j.status) || '', 36);
+        recap = clip((j && j.note) || '', AUTO_LIMITS.RECAP_NOTE);
+        nextStatus = clip((j && j.status) || '', AUTO_LIMITS.STATUS_BAR);
       } catch (error) {
         api.log.warn('自主生活：写生活小结失败 ' + error.message);
       }
       if (nextStatus) {
         s.customStatus = { text: nextStatus, at: Date.now() };
       }
-      const note = recap ? clip(`${item.what}，${recap}`, 90) : item.what;
-      if (recap) item.note = clip(recap, 60);
+      const note = recap ? clip(`${item.what}，${recap}`, AUTO_LIMITS.DONE_NOTE) : item.what;
+      if (recap) item.note = clip(recap, AUTO_LIMITS.DONE_NOTE);
       const d0 = (s.done || []).find((x) => x.agendaId === item.id && Math.abs((Number(x.at) || 0) - startAt) < 5 * 60_000);
       if (d0 && recap) {
         d0.note = note;
-        d0.brief = clip(recap, 30);
+        d0.brief = clip(recap, AUTO_LIMITS.DONE_BRIEF);
       }
       try {
         const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: clip(note, 140), tags: ['自主生活', '生活'], importance: 0.3 });
+        if (mem && typeof mem.addEvent === 'function') mem.addEvent({ text: clip(note, AUTO_LIMITS.EVENT_MEM), tags: ['自主生活', '生活'], importance: 0.3 });
       } catch (error) {}
       if (recap) appendLog({ at: now, action: 'life-recap', why: item.what, detail: '', note: recap, agendaId: item.id });
       api.log.info(`自主生活：${item.what} 忙完了${recap ? ' —— ' + recap : ''}`);

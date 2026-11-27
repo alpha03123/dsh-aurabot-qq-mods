@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { clip, parseJsonLoose, weatherLine, isWet } from './agenda.mjs';
+import { AUTO_LIMITS } from './limits.mjs';
 import { searchAmap, searchOsm, candidatesFor, candidateLine, fmtDistance } from './outing.mjs';
 import { readJson, writeJson } from './helpers.mjs';
 
@@ -125,7 +126,7 @@ export function createOutingFlow({
       try {
         const h = hub();
         if (h && typeof h.pushToSession === 'function') {
-          await h.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: `【系统提醒，不是${name}说的话】你刚出门去了${p.place}，回来把地图上这家店的照片发给了${name}（${p.what}）。这趟是这样的：${clip(p.story, 80)}。用你自己的口气配一两句，像随手分享，别说"我给你发了张图"。这张其实是地图上这家店的图：不用主动说明来源，${name}问起是不是你拍的，就照实说是地图上找的。` }], '');
+          await h.pushToSession({ chatId: `private:${qq}`, kind: 'private', userId: qq, nickname: name }, [{ type: 'text', text: `【系统提醒，不是${name}说的话】你刚出门去了${p.place}，回来把地图上这家店的照片发给了${name}（${p.what}）。这趟是这样的：${clip(p.story, AUTO_LIMITS.OUTING_STORY)}。用你自己的口气配一两句，像随手分享，别说"我给你发了张图"。这张其实是地图上这家店的图：不用主动说明来源，${name}问起是不是你拍的，就照实说是地图上找的。` }], '');
         }
       } catch (error) {}
       try {
@@ -159,10 +160,10 @@ export function createOutingFlow({
       const wet = !!(s.weather && s.weather.today && isWet(s.weather.today.code));
       const now = new Date();
       const nowMin = now.getHours() * 60 + now.getMinutes();
-      const wish = clip(d.detail || d.why, 60);
+      const wish = clip(d.detail || d.why, AUTO_LIMITS.OUTING_WISH);
       // 去哪由她定：place 是想去什么样的地方，query 是地图搜索词（没写就拿 place 搜）
-      const want = clip(d.place || wish, 30);
-      const keywords = clip(d.query || d.place, 30);
+      const want = clip(d.place || wish, AUTO_LIMITS.OUTING_PLACE);
+      const keywords = clip(d.query || d.place, AUTO_LIMITS.OUTING_PLACE);
       if (!keywords) return { note: `想出门${wish ? '（' + wish + '）' : ''}，但没想好去哪`, extra: { ok: false, later: true } };
       const visits = (readJson(outingFile(), () => ({ cache: {}, visits: {} })).visits) || {};
       const home = { lat: Number(c.homeLat), lon: Number(c.homeLon) };
@@ -288,11 +289,11 @@ export function createOutingFlow({
         }
       }
       return {
-        story: clip((j && j.note) || '', 100),
-        bought: Array.isArray(j && j.bought) ? j.bought.map((x) => clip(x, 12)).filter(Boolean).slice(0, 5) : [],
+        story: clip((j && j.note) || '', AUTO_LIMITS.OUTING_STORY),
+        bought: Array.isArray(j && j.bought) ? j.bought.map((x) => clip(x, 30)).filter(Boolean).slice(0, 8) : [],
         spent: Number(j && j.spent) || 0,
         canSee,
-        photoWhat: clip(j && j.photo, 20),
+        photoWhat: clip(j && j.photo, 60),
         photoOk: !!(j && j.photoOk === true),
         share: !!(canSee && j && j.share === true && j.photoOk === true),
       };
@@ -306,22 +307,22 @@ export function createOutingFlow({
       save(s);
       const st = await writeOutingStory(o, s);
       const p = o.place;
-      const note = clip(`去了${p.name}（${p.travel.mode} ${p.travel.minutes} 分钟）${st.story ? '：' + st.story : ''}`, 160);
+      const note = clip(`去了${p.name}（${p.travel.mode} ${p.travel.minutes} 分钟）${st.story ? '：' + st.story : ''}`, AUTO_LIMITS.DONE_NOTE);
       const d0 = (s.done || []).find((x) => x.action === 'outing' && Math.abs((Number(x.at) || 0) - o.departAt) < 5 * 60_000);
       if (d0) {
         d0.note = note;
-        d0.brief = clip(st.story || note, 30);
+        d0.brief = clip(st.story || note, AUTO_LIMITS.DONE_BRIEF);
       }
       try {
         const mem = api.use('memory');
-        if (mem && typeof mem.addEvent === 'function' && st.story) mem.addEvent({ text: clip(`去了${p.name}：${st.story}`, 140), tags: ['自主生活', '生活', '出门'], importance: 0.4 });
+        if (mem && typeof mem.addEvent === 'function' && st.story) mem.addEvent({ text: clip(`去了${p.name}：${st.story}`, AUTO_LIMITS.EVENT_MEM), tags: ['自主生活', '生活', '出门'], importance: 0.4 });
       } catch (error) {}
       s.lastOuting = { day: dayKey(), name: p.name, type: p.type, photoFile: o.photoFile, photoWhat: st.photoWhat, photoOk: st.photoOk, story: st.story, backAt: Date.now() };
       if (st.share && o.photoFile && !s.pendingShare) {
         s.pendingShare = { at: Date.now(), file: o.photoFile, place: p.name, what: st.photoWhat || '这家店', story: st.story };
       } else if (st.share && st.story && canReachOwnerNow(s)) {
         try {
-          const r = await reachOwner(s, { what: `刚从${p.name}回来，想顺手聊聊：${clip(st.story, 80)}`, why: o.wish || '' });
+          const r = await reachOwner(s, { what: `刚从${p.name}回来，想顺手聊聊：${clip(st.story, AUTO_LIMITS.OUTING_STORY)}`, why: o.wish || '' });
           if (r && r.ok) api.log.info(`自主生活：出门回来顺手找主人聊了（${p.name}）`);
         } catch (error) {
           api.log.warn('自主生活：出门回来顺手找主人失败 ' + error.message);

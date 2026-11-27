@@ -25,6 +25,7 @@ import { execFile } from 'node:child_process';
 import { assertNoModelText, checkExec } from './lib/exec-guard.mjs';
 import { scanModuleCode } from './lib/mod-scan.mjs';
 import { grantRows, isGranted, requireGrant } from './lib/grants.mjs';
+import { AUTO_LIMITS } from './lib/limits.mjs';
 import {
   SLOTS,
   SLOT_LABEL,
@@ -303,11 +304,11 @@ export default {
     /** 一条记忆写给小脑看：[什么时候] 内容 */
     function hintLine(m) {
       const t = Number(m.saidAt || m.at) || 0;
-      const title = m.meta && m.meta.title ? clip(m.meta.title, 30) : '';
+      const title = m.meta && m.meta.title ? clip(m.meta.title, AUTO_LIMITS.WEB_TITLE) : '';
       const body = m.kind === 'seen'
-        ? `看过《${title || clip(m.text, 30)}》${title && m.text && m.text !== m.meta.title ? '：' + m.text : ''}`
+        ? `看过《${title || clip(m.text, AUTO_LIMITS.WEB_TITLE)}》${title && m.text && m.text !== m.meta.title ? '：' + m.text : ''}`
         : (m.aboutName && m.source !== 'event' ? `[${m.aboutName}] ` : '') + m.text;
-      return '- ' + (t ? `[${whenLabel(t)}] ` : '') + String(body).replace(/\s+/g, ' ').slice(0, 110);
+      return '- ' + (t ? `[${whenLabel(t)}] ` : '') + String(body).replace(/\s+/g, ' ').slice(0, AUTO_LIMITS.HINT_LINE);
     }
     function whenLabel(t) {
       const d = new Date(t);
@@ -350,7 +351,7 @@ export default {
       // 第一次用（还没有 findings）：从活动流水里把最近 7 天 B 站搜到的要点补上
       const seedFindings = () => readLog(300)
         .filter((r) => r && r.action === 'bili' && r.at > Date.now() - FINDINGS_KEEP_MS && /找到的：/.test(String(r.note || '')))
-        .map((r) => ({ at: r.at, topic: clip(r.topic || '', 20), query: clip((String(r.note).match(/搜「([^」]+)」/) || [])[1] || '', 40), text: String(r.note).split('找到的：').slice(1).join('找到的：').slice(0, 700) }));
+        .map((r) => ({ at: r.at, topic: clip(r.topic || '', AUTO_LIMITS.FINDING_QUERY), query: clip((String(r.note).match(/搜「([^」]+)」/) || [])[1] || '', AUTO_LIMITS.FINDING_QUERY), text: String(r.note).split('找到的：').slice(1).join('找到的：').slice(0, AUTO_LIMITS.FINDING_TEXT) }));
       const keepFindings = (Array.isArray(s.findings) ? s.findings : seedFindings()).filter((x) => x && x.text && x.at > Date.now() - FINDINGS_KEEP_MS).slice(0, FINDINGS_MAX);
       const keepBlocked = Object.fromEntries(Object.entries(s.webBlocked && typeof s.webBlocked === 'object' ? s.webBlocked : {}).filter(([, v]) => v && v.at > Date.now() - 7 * 86_400_000));
       if (s.day !== dayKey()) {
@@ -473,7 +474,7 @@ export default {
         for (const r of h.chatLogOf(day) || []) {
           if (!r || r.chatId !== `private:${qq}` || r.forgottenAt || !(r.t >= sinceMs)) continue;
           if (r.who === '系统') continue;
-          rows.push(`[${fmtMDHM(r.t)}] ${r.who === 'bot' ? '你' : name}：${clip(r.text, 80)}`);
+          rows.push(`[${fmtMDHM(r.t)}] ${r.who === 'bot' ? '你' : name}：${clip(r.text, AUTO_LIMITS.CHAT_LINE)}`);
         }
       }
       return rows.slice(-limit);
@@ -519,7 +520,7 @@ export default {
         if (Date.now() - lastOwnerContact() < 15 * 60_000) return { ok: false, later: true, note: '你们刚聊过，先不专门去找' };
         if ((Number(s.agenda.speaks) || 0) >= SPEAK_MAX_PER_DAY) return { ok: false, note: `今天已经主动找过他 ${s.agenda.speaks} 次了，先不找` };
       }
-      const topic = clip(what, 80) + (why ? `（${clip(why, 40)}）` : '');
+      const topic = clip(what, AUTO_LIMITS.REACH_WHAT) + (why ? `（${clip(why, AUTO_LIMITS.REACH_WHY)}）` : '');
       // 安排是早上（甚至前一天）写的：开口前给她现在的时间、天气与最近私聊（带日期时间戳），话题里的「今天/明天」以现在为准
       const recentChat = ownerChatLines(Date.now() - 48 * 3600_000, 4);
       const chatSnap = recentChat.length ? `\n最近私聊：\n${recentChat.join('\n')}` : '';
@@ -544,8 +545,8 @@ export default {
         ? String(h.lastBotToOwner.text || '').replace(/\s+/g, ' ').trim()
         : '';
       return delivered
-        ? { ok: true, note: `去找主人说：${actualSent ? clip(actualSent, 60) : clip(what, 40)}` }
-        : { ok: false, later: true, note: `想找主人聊「${clip(what, 30)}」，但最后没开口（沉默）` };
+        ? { ok: true, note: `去找主人说：${actualSent ? clip(actualSent, AUTO_LIMITS.REACH_SENT_NOTE) : clip(what, AUTO_LIMITS.REACH_SENT_NOTE)}` }
+        : { ok: false, later: true, note: `想找主人聊「${clip(what, AUTO_LIMITS.REACH_SENT_NOTE)}」，但最后没开口（沉默）` };
     }
 
     /** 刚刷完 B 站：从记忆里把这一轮看过的视频捞回来（bili.run 只回数量，没有标题） */
@@ -558,8 +559,8 @@ export default {
           .filter((m) => m && m.kind === 'seen' && Number(m.at) >= startAt)
           .slice(0, limit)
           .map((m) => {
-            const title = clip(m.meta && m.meta.title, 30);
-            const felt = clip(m.text, 40);
+            const title = clip(m.meta && m.meta.title, AUTO_LIMITS.WEB_TITLE);
+            const felt = clip(m.text, AUTO_LIMITS.WEB_SAW);
             return title ? `《${title}》${felt && felt !== title ? '（' + felt + '）' : ''}` : felt;
           });
       } catch (error) {
@@ -774,18 +775,18 @@ export default {
         if (b && typeof b.run === 'function') {
           const startAt = Date.now() - 5_000;
           const allowShare = canReachOwnerNow(s);
-          const query = clip(d.query, 40);
+          const query = clip(d.query, AUTO_LIMITS.FINDING_QUERY);
           const r = await b.run({ force: true, allowShare, query });
           if (r && Number(r.shared) + Number(r.shots || 0) > 0) s.agenda.speaks = (Number(s.agenda.speaks) || 0) + 1;
           const seen = r && r.ok ? seenSince(startAt) : [];
           const base = (r && r.message) || '去 B 站看了看';
           if (query) {
             // 专门去找东西：找到了把要点写进结果（下一轮决策看得到）；没找到 / 没搜到如实记成没找到，不算做成，也不触发停用一天
-            const answers = (r && Array.isArray(r.answers) ? r.answers : []).slice(0, 3);
+            const answers = (r && Array.isArray(r.answers) ? r.answers : []).slice(0, 5);
             if (r && r.ok && answers.length) {
               return {
-                note: `${base}。找到的：${answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 120)}`).join('；')}`,
-                extra: { ok: true, finding: { query, text: answers.map((a) => `《${clip(a.title, 24)}》${clip(a.text, 220)}`).join('；') } },
+                note: `${base}。找到的：${answers.map((a) => `《${clip(a.title, AUTO_LIMITS.WEB_TITLE)}》${clip(a.text, AUTO_LIMITS.SEARCH_ANSWER)}`).join('；')}`,
+                extra: { ok: true, finding: { query, text: answers.map((a) => `《${clip(a.title, AUTO_LIMITS.WEB_TITLE)}》${clip(a.text, AUTO_LIMITS.SEARCH_ANSWER)}`).join('；') } },
               };
             }
             return { note: seen.length ? `${base}：${seen.join('、')}` : base, extra: { ok: false, later: true } };
@@ -804,7 +805,7 @@ export default {
       if (d.action === 'draw') {
         const ig = api.use('imagegen');
         if (!ig || typeof ig.generate !== 'function') return { note: '想画画，但生图那个模块没开着', extra: { ok: false } };
-        const prompt = String(d.detail || d.why || '随便画点什么').slice(0, 200);
+        const prompt = String(d.detail || d.why || '随便画点什么').slice(0, AUTO_LIMITS.DRAW_PROMPT);
         const buf = await ig.generate(prompt);
         if (!buf || !buf.length) return { note: '想画张图，但没生成出来', extra: { ok: false } };
 
@@ -814,7 +815,7 @@ export default {
         fs.mkdirSync(dir, { recursive: true });
         const local = path.join(dir, name);
         fs.writeFileSync(local, buf);
-        return { note: `画了张图（存在本机 art/）：${prompt.slice(0, 50)}`, extra: { file: local } };
+        return { note: `画了张图（存在本机 art/）：${prompt.slice(0, AUTO_LIMITS.DONE_BRIEF)}`, extra: { file: local } };
       }
 
       if (d.action === 'phone') {
@@ -916,7 +917,7 @@ export default {
       // 没有执行器的动作（吃饭、散步、收拾房间……）：当成她真过了这一段生活。
       // 不跑任何命令，只把她写的那句当经历记下来，之后聊天能提起。
       return {
-        note: clip(d.detail || d.why || d.action, 80),
+        note: clip(d.detail || d.why || d.action, AUTO_LIMITS.DONE_NOTE),
         extra: { ok: true, life: true },
       };
     }
@@ -930,7 +931,7 @@ export default {
       const p = String(c.playfulness || 'medium');
       const me = personaBrief();
       const lines = [
-        me.brief ? `你的人设（保持这个口气和性格，别变成通用旁白）：${clip(me.brief, 220)}` : '',
+        me.brief ? `你的人设（保持这个口气和性格，别变成通用旁白）：${clip(me.brief, AUTO_LIMITS.PERSONA_BRIEF)}` : '',
         `你现在的性子偏 ${mbti}：${style.feel}。`,
         `说话的样子：${style.tone}（自然一点，不用刻意堆感叹号）。`,
       ].filter(Boolean);
@@ -1074,7 +1075,7 @@ export default {
         memHints.length ? `你想得起来的几件事：\n${memHints.join('\n')}` : '',
         (() => {
           const last = diaryRecent(1)[0];
-          return last ? `你上一篇日记（${last.day} ${last.time}）写过：${clip(last.text, 120)}` : '';
+          return last ? `你上一篇日记（${last.day} ${last.time}）写过：${clip(last.text, AUTO_LIMITS.DIARY_EXCERPT)}` : '';
         })(),
         chat.length ? `最近和${owner}的私聊：\n${chat.join('\n')}` : `最近没和${owner}私聊。`,
         mood ? `你现在的心情：${mood}` : '',
@@ -1137,8 +1138,8 @@ export default {
         return false;
       }
 
-      a.theme = clip(j.theme, 40);
-      if (j.status) s.customStatus = { text: clip(j.status, 36), at: Date.now() };
+      a.theme = clip(j.theme, AUTO_LIMITS.AGENDA_WHAT);
+      if (j.status) s.customStatus = { text: clip(j.status, AUTO_LIMITS.STATUS_BAR), at: Date.now() };
       if (!c.fixedSchedule) {
         const parseHM = (str) => {
           const mm = String(str || '').trim().match(/^(\d{1,2})[:：](\d{2})$/);
@@ -1196,7 +1197,7 @@ export default {
         const r = addItem(a, { slot, what: it.what, why: it.why, from: 'self', action: it.action, age: inheritAge(it.what, carries), at, ...selfReport(it) }, { hour });
         if (r.ok) added.push(r.item);
       }
-      const recap = clip(j.yesterday, 120);
+      const recap = clip(j.yesterday, AUTO_LIMITS.RECAP_NOTE);
       if (recap && y) {
         a.recap = recap;
         // 昨晚早睡、一篇日记都没写：今早补记一段
@@ -1525,14 +1526,14 @@ export default {
       // 安排里那条：做成了就勾掉；没做成留着，记一下卡在哪
       if (item) {
         if (result.extra && result.extra.ok === false) {
-          item.note = clip(result.note, 40);
+          item.note = clip(result.note, AUTO_LIMITS.DONE_NOTE);
           item.tries = (Number(item.tries) || 0) + 1;
         } else if (d.agendaDone === false) {
           // 只是为这条做了准备（查配方、看教程）：记下做过什么，这条本身还没做
-          item.progress = clip(result.note, 160);
+          item.progress = clip(result.note, AUTO_LIMITS.DONE_NOTE);
         } else {
           item.state = 'done';
-          item.note = clip(result.note, 60);
+          item.note = clip(result.note, AUTO_LIMITS.DONE_NOTE);
           item.doneAt = Date.now();
         }
       }
@@ -1542,7 +1543,7 @@ export default {
         if (d.retrySoon) focus.retryAt = Date.now() + 10 * 60_000;
         else if (isFree) {
           focus.state = 'done';
-          focus.note = clip(result.note || d.detail || d.action, 60);
+          focus.note = clip(result.note || d.detail || d.action, AUTO_LIMITS.DONE_NOTE);
           focus.doneAt = Date.now();
         } else {
           focus.at = Date.now() + 60 * 60_000;
@@ -1564,11 +1565,11 @@ export default {
           s.project = {
             name: d.action,
             times: (Number(s.project.times) || 1) + 1,
-            lastNote: String(result.note || '').slice(0, 80),
+            lastNote: String(result.note || '').slice(0, AUTO_LIMITS.DONE_NOTE),
             at,
           };
         } else {
-          s.project = { name: d.action, times: 1, lastNote: String(result.note || '').slice(0, 80), at };
+          s.project = { name: d.action, times: 1, lastNote: String(result.note || '').slice(0, AUTO_LIMITS.DONE_NOTE), at };
         }
       }
       // 生活里的事写进记忆（做过的事），聊天时她能想起来「刚吃了碗面」；节流 15 分钟
@@ -1577,7 +1578,7 @@ export default {
         try {
           const mem = api.use('memory');
           if (mem && typeof mem.addEvent === 'function') {
-            mem.addEvent({ text: clip(result.note, 120), tags: ['自主生活', '生活'], importance: 0.35 });
+            mem.addEvent({ text: clip(result.note, AUTO_LIMITS.EVENT_MEM), tags: ['自主生活', '生活'], importance: 0.35 });
             s.lastLifeMemoAt = Date.now();
           }
         } catch (error) {}
@@ -1591,7 +1592,7 @@ export default {
           const mem = api.use('memory');
           if (mem && typeof mem.add === 'function') {
             mem.add({
-              text: String(result.note || '').slice(0, 160) || (d.action === 'draw' ? '画了张图' : '玩了会儿手机'),
+              text: String(result.note || '').slice(0, AUTO_LIMITS.EVENT_MEM) || (d.action === 'draw' ? '画了张图' : '玩了会儿手机'),
               tags: [d.action],
               importance: 0.5,
               source: 'autonomy',
@@ -1603,7 +1604,7 @@ export default {
       // 她发明的动作记下来，下次提示词里会提到，能接着做
       if (!STANDARD_ACTIONS.has(d.action)) {
         const prev = s.customActions[d.action] || { count: 0 };
-        s.customActions[d.action] = { count: (Number(prev.count) || 0) + 1, last: at, sample: String(d.detail || '').slice(0, 80) };
+        s.customActions[d.action] = { count: (Number(prev.count) || 0) + 1, last: at, sample: String(d.detail || '').slice(0, AUTO_LIMITS.DONE_BRIEF) };
       }
       // 当天动作累计：额度按这个数（done 只留 50 条，拿它数额度会越算越少）
       if (!s.dayCounts || typeof s.dayCounts !== 'object') s.dayCounts = {};
@@ -1614,18 +1615,18 @@ export default {
         const own = d.busyMin != null ? d.busyMin : item && item.busyMin != null ? item.busyMin : null;
         const mins = NOT_BUSY_ACTIONS.includes(d.action) ? 0 : Number(result.extra && result.extra.busyMin) || (own != null ? own : busyMinutes(d.action));
         const canPause = d.canPause != null ? d.canPause : item && item.canPause != null ? item.canPause : null;
-        const stText = clip(d.status || (item && item.status) || '', 36);
+        const stText = clip(d.status || (item && item.status) || '', AUTO_LIMITS.STATUS_BAR);
         if (stText) s.customStatus = { text: stText, at };
-        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, 24), canPause, ...(stText ? { status: stText } : {}) };
+        if (mins > 0) s.busy = { since: at, until: at + mins * 60_000, what: clip((result.extra && result.extra.busyWhat) || (result.extra && result.extra.life ? result.note : '') || (item && item.what) || d.detail || d.action, AUTO_LIMITS.AGENDA_BRIEF), canPause, ...(stText ? { status: stText } : {}) };
       }
       s.done = [
-        { at, action: d.action, note: String(result.note || '').slice(0, 160), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.state === 'done' ? item.what : '') || d.detail || d.why, 30), dry, kind: d.kind || '', why: String(d.why || '').slice(0, 60), ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
+        { at, action: d.action, note: String(result.note || '').slice(0, AUTO_LIMITS.DONE_NOTE), brief: clip((result.extra && result.extra.life ? result.note : '') || (item && item.state === 'done' ? item.what : '') || d.detail || d.why, AUTO_LIMITS.DONE_BRIEF), dry, kind: d.kind || '', why: String(d.why || '').slice(0, AUTO_LIMITS.AGENDA_WHY), ...(d.topic ? { topic: d.topic } : {}), ...(item ? { agendaId: item.id } : {}) },
         ...(s.done || []),
       ].slice(0, 50);
       if (d.topic && d.action !== 'rest') s.topicLog = [{ at, topic: d.topic, action: d.action }, ...(s.topicLog || [])].slice(0, 60);
       if (result.extra && result.extra.finding && result.extra.finding.text && !s.__trial) {
         const f = result.extra.finding;
-        s.findings = [{ at, topic: clip(d.topic || f.query, 20), query: clip(f.query, 40), text: String(f.text).slice(0, 700) }, ...(s.findings || [])].slice(0, FINDINGS_MAX);
+        s.findings = [{ at, topic: clip(d.topic || f.query, AUTO_LIMITS.FINDING_QUERY), query: clip(f.query, AUTO_LIMITS.FINDING_QUERY), text: String(f.text).slice(0, AUTO_LIMITS.FINDING_TEXT) }, ...(s.findings || [])].slice(0, FINDINGS_MAX);
       }
       // 空想和歇着都不覆盖「留给自己的话」——否则那句话会在下次提示词里自己喂自己
       if (!dry && !resting) s.note = d.why || '';
@@ -1640,7 +1641,7 @@ export default {
         why: d.why,
         detail: d.detail || (d.steps && d.steps.length ? d.steps.join('\n───\n') : ''),
         note: result.note,
-        output: result.extra && result.extra.output ? String(result.extra.output).slice(0, 600) : '',
+        output: result.extra && result.extra.output ? String(result.extra.output).slice(0, AUTO_LIMITS.EXEC_OUTPUT) : '',
         nextMinutes: s.nextWakeAt ? Math.max(0, Math.round((s.nextWakeAt - Date.now()) / 60_000)) : 0,
         ...(d.topic ? { topic: d.topic } : {}),
         ...(item ? { agendaId: item.id, agendaDone: d.agendaDone !== false } : {}),
@@ -1977,7 +1978,7 @@ export default {
             const findTimer = () => {
               const id = String(a.id || '').trim();
               if (id) return activeTimers().find((x) => x.id === id) || null;
-              const q = clip(a.what, 40);
+              const q = clip(a.what, AUTO_LIMITS.AGENDA_WHAT);
               if (!q) return null;
               return activeTimers().find((x) => x.what === q || similarText(x.what, q) >= 0.6 || x.what.includes(clip(q, 10)) || q.includes(clip(x.what, 10))) || null;
             };
@@ -1985,7 +1986,7 @@ export default {
             if (op === 'add' && (a.time || followup || Number(a.day) > 0)) {
               const at = parseWhen(a.time, a.day, { now, slot: a.slot });
               if (!at) return { ok: false, message: `时间「${a.time}」没看懂，写成 22:00 这样` };
-              const what = clip(a.what, 40);
+              const what = clip(a.what, AUTO_LIMITS.AGENDA_WHAT);
               if (!what) return { ok: false, message: '要提醒什么没写' };
               const wantKind = followup ? 'followup' : undefined;
               const dup = activeTimers().find((t) => t.kind === wantKind && (t.what === what || similarText(t.what, what) >= 0.6));
@@ -1997,7 +1998,7 @@ export default {
                 };
               }
               const tid = 't' + now.toString(36);
-              s.timers = [...(s.timers || []), { id: tid, at, what, why: clip(a.why, 40), fired: false, updatedAt: now, ...(followup ? { kind: 'followup' } : {}) }];
+              s.timers = [...(s.timers || []), { id: tid, at, what, why: clip(a.why, AUTO_LIMITS.AGENDA_WHY), fired: false, updatedAt: now, ...(followup ? { kind: 'followup' } : {}) }];
               message = `记下了 [${tid}]：${fmtTimer(at)} ${what}`;
             } else if (op === 'defer' && ((targetId && targetId.startsWith('t')) || (!targetId && a.what && findTimer()) || (targetId && findTimer()))) {
               const t = findTimer();
@@ -2019,7 +2020,7 @@ export default {
               t.fired = false;
               t.dropped = false;
               t.updatedAt = now;
-              if (a.why) t.why = clip(a.why, 40);
+              if (a.why) t.why = clip(a.why, AUTO_LIMITS.AGENDA_WHY);
               message = `已把 [${t.id}]「${t.what}」改到 ${fmtTimer(at)}`;
             } else if ((op === 'drop' || op === 'done') && ((targetId && targetId.startsWith('t')) || findTimer())) {
               const t = findTimer();
@@ -2065,8 +2066,8 @@ export default {
         return out + '…';
       };
       const line = (x) => {
-        const what = x.action === 'rest' ? safeClip(x.brief || x.note || '歇了一会儿', 110) : safeClip(x.note || x.brief || x.action, 115);
-        return `${clock(x.at)} ${what}${x.why && x.action !== 'rest' ? `（${safeClip(x.why, 36)}）` : ''}`;
+        const what = x.action === 'rest' ? safeClip(x.brief || x.note || '歇了一会儿', AUTO_LIMITS.LIFELOG_LINE) : safeClip(x.note || x.brief || x.action, AUTO_LIMITS.LIFELOG_LINE);
+        return `${clock(x.at)} ${what}${x.why && x.action !== 'rest' ? `（${safeClip(x.why, AUTO_LIMITS.LIFELOG_WHY)}）` : ''}`;
       };
       s.lifeShown = Object.fromEntries([...Object.entries(s.lifeShown || {}).filter(([k]) => k !== key).slice(-4), [key, rows[rows.length - 1].at]]);
       save(s);
@@ -2086,7 +2087,7 @@ export default {
         if (s.weather && s.weather.now) bg.push(`天气：${weatherLine(s.weather, { full: true })}`);
         bg.push(statusLine(s.agenda, last, { clockOf: clock, busy: s.busy }));
         const curStatus = (s.busy && Number(s.busy.until) > Date.now() && s.busy.status) || (s.customStatus && s.customStatus.text) || '';
-        if (curStatus) bg.push(`当前 Discord 状态栏：「${clip(curStatus, 36)}」`);
+        if (curStatus) bg.push(`当前 Discord 状态栏：「${clip(curStatus, AUTO_LIMITS.STATUS_BAR)}」`);
         const parts = [`【当前背景】${bg.join('｜')}`];
         const todoItems = ((s.agenda && s.agenda.items) || [])
           .filter((x) => x && x.state === 'todo' && x.what)
@@ -2103,14 +2104,14 @@ export default {
           : `平时大概 ${Number(cNow.awakeTo) === 24 ? '半夜12点' : (Number(cNow.awakeTo) || 23) + '点'} 左右睡`;
         if (todoItems.length || todayTimers.length || sleepHint) {
           const slotZh = { morning: '上午', afternoon: '下午', evening: '晚上', night: '深夜' };
-          const briefItems = todoItems.slice(0, 6).map((x) => `${x.at ? clock(x.at) + '·' : (slotZh[x.slot] ? slotZh[x.slot] + '·' : '')}${clip(x.what, 18)}`);
-          for (const t of todayTimers.slice(0, 2)) briefItems.push(`${clock(t.at)}·${clip(t.what, 16)}`);
+          const briefItems = todoItems.slice(0, 8).map((x) => `${x.at ? clock(x.at) + '·' : (slotZh[x.slot] ? slotZh[x.slot] + '·' : '')}${clip(x.what, AUTO_LIMITS.AGENDA_BRIEF)}`);
+          for (const t of todayTimers.slice(0, 4)) briefItems.push(`${clock(t.at)}·${clip(t.what, AUTO_LIMITS.AGENDA_BRIEF)}`);
           if (sleepHint) briefItems.push(sleepHint);
           parts.push(`【今天还打算】${briefItems.join('、')}`);
         }
         if (futureTimers.length) {
-          const fmtFuture = (t) => `${new Date(t.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}·${clip(t.what, 18)}`;
-          parts.push(`【之后约好的】${futureTimers.slice(0, 3).map(fmtFuture).join('、')}`);
+          const fmtFuture = (t) => `${new Date(t.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}·${clip(t.what, AUTO_LIMITS.AGENDA_BRIEF)}`;
+          parts.push(`【之后约好的】${futureTimers.slice(0, 5).map(fmtFuture).join('、')}`);
         }
         const life = lifeLogBlock(s, sessionId);
         if (life) parts.push(life);
@@ -2120,7 +2121,7 @@ export default {
         }
         if (s.outing && s.outing.returnAt > Date.now()) {
           const p = s.outing.place;
-          parts.push(`【在外面】你${clock(s.outing.departAt)}出的门，现在人在外面（${p.name}${s.outing.wish ? '，出门是想' + clip(s.outing.wish, 20) : ''}），大概 ${clock(s.outing.returnAt)} 到家。是拿手机回的，回得短一点；还没逛完，别说成已经回家了，也别说已经买好了什么。${s.outing.photoFile ? '他想看这儿的样子，可以用 outing_photo 发张照片。' : ''}`);
+          parts.push(`【在外面】你${clock(s.outing.departAt)}出的门，现在人在外面（${p.name}${s.outing.wish ? '，出门是想' + clip(s.outing.wish, AUTO_LIMITS.OUTING_WISH) : ''}），大概 ${clock(s.outing.returnAt)} 到家。是拿手机回的，回得短一点；还没逛完，别说成已经回家了，也别说已经买好了什么。${s.outing.photoFile ? '他想看这儿的样子，可以用 outing_photo 发张照片。' : ''}`);
         } else if (s.lastOuting && s.lastOuting.day === dayKey() && s.lastOuting.photoFile && s.lastOuting.photoOk !== false && s.lastOuting.story && Date.now() - s.lastOuting.backAt < 6 * 3600_000) {
           parts.push(`【出门】你今天去过${s.lastOuting.name}，他想看那儿的样子可以用 outing_photo 发张照片。`);
         }
@@ -2187,13 +2188,13 @@ export default {
           if (dueBedtime || dueCatchUp) {
             const targetDay = dueBedtime ? today : sessDay;
             const ctxLines = [];
-            const activeT = (s.timers || []).filter((t) => t && !t.fired && !t.dropped && t.at > now).sort((a, b) => a.at - b.at).slice(0, 6);
+            const activeT = (s.timers || []).filter((t) => t && !t.fired && !t.dropped && t.at > now).sort((a, b) => a.at - b.at).slice(0, 10);
             if (activeT.length) {
-              ctxLines.push('已敲定的约定：' + activeT.map((t) => `${new Date(t.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })} ${clip(t.what, 30)}`).join('；'));
+              ctxLines.push('已敲定的约定：' + activeT.map((t) => `${new Date(t.at).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })} ${clip(t.what, AUTO_LIMITS.AGENDA_WHAT)}`).join('；'));
             }
-            const recentF = (s.findings || []).filter((f) => f && f.text && f.at > now - FINDINGS_KEEP_MS).slice(0, 5);
+            const recentF = (s.findings || []).filter((f) => f && f.text && f.at > now - FINDINGS_KEEP_MS).slice(0, 8);
             if (recentF.length) {
-              ctxLines.push('近期查到的事实线索：\n' + recentF.map((f) => `- [${ymd(f.at)}] ${clip(f.query || f.topic, 24)}：${clip(f.text, 140)}`).join('\n'));
+              ctxLines.push('近期查到的事实线索：\n' + recentF.map((f) => `- [${ymd(f.at)}] ${clip(f.query || f.topic, AUTO_LIMITS.FINDING_QUERY)}：${clip(f.text, AUTO_LIMITS.FINDING_SHOWN)}`).join('\n'));
             }
             const extraContext = ctxLines.join('\n');
             const r = await mem.sessionRollover(ownerChatId, { day: targetDay, merge: true, dream: true, lastLines: 0, extraContext });
@@ -2361,7 +2362,7 @@ export default {
         const raw = fs.readFileSync(path.join(aurabotDir, 'personas', id + '.md'), 'utf8');
         const fm = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n?/);
         const name = fm ? ((fm[1].match(/^name:\s*(.+)$/m) || [])[1] || '').trim().replace(/^['"]|['"]$/g, '') : '';
-        return { name, brief: clip((fm ? raw.slice(fm[0].length) : raw).replace(/\s+/g, ' ').trim(), 500) };
+        return { name, brief: clip((fm ? raw.slice(fm[0].length) : raw).replace(/\s+/g, ' ').trim(), AUTO_LIMITS.PERSONA_BRIEF) };
       } catch (error) {
         return { name: '', brief: '' };
       }
@@ -2403,8 +2404,8 @@ export default {
         const j = parseJsonLoose(out) || {};
         const m = Number(j.minutes);
         const minutes = Number.isFinite(m) ? Math.max(0, Math.min(maxDelay, Math.round(m))) : 0;
-        const why = clip(j.why || '', 60);
-        api.log.info(`自主生活：${ctx.who}发来私聊（${texts.length} 条），她${minutes ? `打算 ${minutes} 分钟后再看` : '现在就回'}——${clip(why, 40)}`);
+        const why = clip(j.why || '', AUTO_LIMITS.HOLD_WHY);
+        api.log.info(`自主生活：${ctx.who}发来私聊（${texts.length} 条），她${minutes ? `打算 ${minutes} 分钟后再看` : '现在就回'}——${clip(why, AUTO_LIMITS.HOLD_WHY)}`);
         return { minutes, why };
       } catch (error) {
         api.log.warn('自主生活：问小脑回不回出错，直接回 ' + error.message);
@@ -2428,7 +2429,7 @@ export default {
           });
         judging.set(chatId, batch);
       }
-      if (!j.closed && text) j.texts.push(clip(text, 200));
+      if (!j.closed && text) j.texts.push(clip(text, AUTO_LIMITS.CHAT_LINE));
       return j.promise;
     }
     /** 她现在在忙什么（在外面 / 手上有事）；没在忙返回 null */
@@ -2566,7 +2567,7 @@ export default {
         const gid = String(msg.groupId);
         const e = hg[gid] || (hg[gid] = { since: Date.now(), rows: [], count: 0 });
         e.count += 1;
-        e.rows = [...e.rows, { t: Date.now(), who: clip(msg.nickname || msg.userId, 16), text: clip(msg.text, 80) }].slice(-8);
+        e.rows = [...e.rows, { t: Date.now(), who: clip(msg.nickname || msg.userId, 24), text: clip(msg.text, AUTO_LIMITS.CHAT_LINE) }].slice(-12);
         const p = wakeChance(s, c, { count: e.count, urgent: isUrgent(msg.text), owner: api.isOwner(msg.userId) });
         if (Math.random() < p) {
           delete hg[gid];
@@ -2644,11 +2645,11 @@ export default {
             : h.reason === 'sleep'
               ? `刚睡醒才看到这些消息（最早一条是 ${ago}）`
               : h.reason === 'busy'
-                ? `刚才在${h.what || '忙别的'}${h.why ? `（你当时心里想的是：${clip(h.why, 50)}）` : ''}，现在才回（最早一条是 ${ago}）`
+                ? `刚才在${h.what || '忙别的'}${h.why ? `（你当时心里想的是：${clip(h.why, AUTO_LIMITS.HOLD_WHY)}）` : ''}，现在才回（最早一条是 ${ago}）`
                 : (() => {
                     const recentRest = (s.done || []).find((x) => x && x.action === 'rest' && Date.now() - (Number(x.at) || 0) < 60 * 60_000 && (x.brief || x.why));
                     return recentRest
-                      ? `刚才在发呆/歇着（${clip(recentRest.brief || recentRest.why, 28)}），没看手机，现在才看到（最早一条是 ${ago}）`
+                      ? `刚才在发呆/歇着（${clip(recentRest.brief || recentRest.why, AUTO_LIMITS.DONE_BRIEF)}），没看手机，现在才看到（最早一条是 ${ago}）`
                       : `刚才没看手机，现在才看到（最早一条是 ${ago}）`;
                   })();
         const note = mins >= 2 || h.reason === 'sleep'
@@ -2695,7 +2696,7 @@ export default {
         } catch (error) {}
         const userId = String(h.userId || chatId.replace(/^private:/, ''));
         const name = userId === ownerOf().qq ? ownerOf().name : unanswered[0].who || '对方';
-        const lines = unanswered.slice(-6).map((r) => `${fmtHM(r.t)} ${clip(r.text, 80)}`).join('\n');
+        const lines = unanswered.slice(-10).map((r) => `${fmtHM(r.t)} ${clip(r.text, AUTO_LIMITS.CHAT_LINE)}`).join('\n');
         const longAgo = now - Number(h.since || now) > 3 * 3600_000;
         const head = longAgo
           ? `${name} ${fmtHM(Number(h.since))} 左右发的消息，你一直没顾上（${h.reason === 'sleep' ? '睡着了' : '后来就下线了'}），现在才看到`

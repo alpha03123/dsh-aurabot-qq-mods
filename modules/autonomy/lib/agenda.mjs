@@ -46,6 +46,8 @@ export function normSlot(value, fallback = '') {
 /** 时段先后：过去的时段 < 当前 < 以后（深夜接在晚上后面） */
 const slotRank = (slot) => SLOTS.indexOf(slot);
 
+import { AUTO_LIMITS } from './limits.mjs';
+
 export function clip(text, max) {
   return String(text == null ? '' : text).replace(/\s+/g, ' ').trim().slice(0, max);
 }
@@ -86,7 +88,7 @@ export function normalizeAgenda(raw, date) {
  * 已经做完的不拦：今天做过的事想再来一次（蛋糕塌了再试一回）是她自己的决定。
  */
 export function addItem(agenda, { slot, what, why = '', from = 'self', action = '', age = 0, at = 0, busyMin = null, canPause = null, energy = null, status = null } = {}, { hour = new Date().getHours(), now = Date.now() } = {}) {
-  const w = clip(what, 40);
+  const w = clip(what, AUTO_LIMITS.AGENDA_WHAT);
   if (!w) return { ok: false, reason: '没写要做什么' };
   if (agenda.items.length >= MAX_ITEMS) return { ok: false, reason: `今天已经排了 ${MAX_ITEMS} 条，别再加了` };
   const dup = agenda.items.find((x) => x.state === 'todo' && similarText(x.what, w) >= SAME_ITEM_SIM);
@@ -95,7 +97,7 @@ export function addItem(agenda, { slot, what, why = '', from = 'self', action = 
     id: 'a' + agenda.nextId,
     slot: normSlot(slot, slotOf(hour)),
     what: w,
-    why: clip(why, 40),
+    why: clip(why, AUTO_LIMITS.AGENDA_WHY),
     from: ['self', 'seen', 'promise'].includes(from) ? from : 'self',
     action: clip(action, 16),
     state: 'todo',
@@ -106,7 +108,7 @@ export function addItem(agenda, { slot, what, why = '', from = 'self', action = 
     ...(busyMin !== null ? { busyMin } : {}),
     ...(canPause !== null ? { canPause } : {}),
     ...(energy !== null ? { energy } : {}),
-    ...(status ? { status: clip(status, 36) } : {}),
+    ...(status ? { status: clip(status, AUTO_LIMITS.STATUS_BAR) } : {}),
   };
   agenda.nextId += 1;
   agenda.items.push(item);
@@ -123,7 +125,7 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
   for (const raw of (Array.isArray(ops) ? ops : []).slice(0, max)) {
     if (!raw || typeof raw !== 'object') continue;
     const op = String(raw.op || '').toLowerCase();
-    const why = clip(raw.why, 40);
+    const why = clip(raw.why, AUTO_LIMITS.AGENDA_WHY);
     if (op === 'add') {
       const from = by === 'owner' ? 'promise' : raw.from === 'seen' ? 'seen' : 'self';
       const at = clockToday(raw.time, now);
@@ -131,7 +133,7 @@ export function applyOps(agenda, ops, { by = 'self', hour = new Date().getHours(
       if (r.ok) {
         if (by === 'owner') r.item.ownerAt = now;
         applied.push(`加了 ${r.item.id}「${r.item.what}」（${at ? fmtClock(at) : SLOT_LABEL[r.item.slot]}）`);
-      } else rejected.push(`没加「${clip(raw.what, 20)}」：${r.reason}`);
+      } else rejected.push(`没加「${clip(raw.what, AUTO_LIMITS.AGENDA_BRIEF)}」：${r.reason}`);
       continue;
     }
     const item = agenda.items.find((x) => x.id === String(raw.id || '').trim());
@@ -323,8 +325,8 @@ export function agendaBlock(agenda, { hour = new Date().getHours(), timers = [],
 
 /** 聊天时塞进上下文的一句：只说现在或刚才在干嘛，不带「接下来想做什么」以免打断聊天 */
 export function statusLine(_agenda, lastDone, { now = Date.now(), clockOf = fmtClock, busy = null } = {}) {
-  const did = lastDone && clip(lastDone.brief || lastDone.note, 30);
-  const doing = busy && Number(busy.until) > now && busy.what ? clip(busy.what, 30) : '';
+  const did = lastDone && clip(lastDone.brief || lastDone.note, AUTO_LIMITS.DONE_BRIEF);
+  const doing = busy && Number(busy.until) > now && busy.what ? clip(busy.what, AUTO_LIMITS.AGENDA_BRIEF) : '';
   if (doing) return `正在${doing}`;
   if (did && now - (Number(lastDone.at) || 0) < 3 * 3600_000) return `刚才（${clockOf(lastDone.at)}）${did}`;
   return '自己待着，没在忙什么（别编自己刚才在做什么）';
