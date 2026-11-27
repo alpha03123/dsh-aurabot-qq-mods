@@ -714,7 +714,7 @@ export default {
       return `把看到的一张图发给了他：${what}`;
     }
 
-    const { placesOf, pickPlace, rememberVisit, fetchPlacePhoto, sendOutingPhoto, tickPendingShare, goOut, writeOutingStory, finishOuting } = createOutingFlow({
+    const { outingFile, placesOf, pickPlace, rememberVisit, fetchPlacePhoto, sendOutingPhoto, tickPendingShare, goOut, writeOutingStory, finishOuting } = createOutingFlow({
       api, cfg, ask, save, clock, dayKey, ownerOf, hub, appendLog,
       canReachOwnerNow, canShareImage,
       isAwakeHour: (...a) => isAwakeHour(...a),
@@ -2282,13 +2282,15 @@ export default {
       return 0;
     }
 
-    const { bedtime, ensureEnergy, addEnergy, energyPrompt, moodNudge, refreshWeather, tickTimedItems, tickLifeRecaps } = createLifeTick({
+    const { bedtime, ensureEnergy, energyNow, addEnergy, energyPrompt, moodNudge, refreshWeather, tickTimedItems, tickLifeRecaps } = createLifeTick({
       api, cfg, ask, save, stateFile, clock, dayKey, ymd, randMin, ownerOf,
       isAwakeHour, nextSleepAt, nextAwakeAt,
       busyNow: (...a) => busyNow(...a),
       autoItem: (...a) => autoItem(...a),
       appendLog, diaryCount, writeLocalDiary, canReachOwnerNow, reachOwner, styleHint,
     });
+
+    const heldOf = (s) => (s.held && typeof s.held === 'object' ? s.held : (s.held = {}));
 
     function wakeChance(s, c, { count = 1, urgent = false, owner = false } = {}) {
       let p = 0.05 + 0.1 * Math.max(0, count - 1) + (urgent ? 0.25 : 0) + (owner ? 0.05 : 0);

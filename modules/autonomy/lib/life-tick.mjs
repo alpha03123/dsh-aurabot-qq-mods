@@ -206,12 +206,5 @@ export function createLifeTick({
       return true;
     }
 
-    const heldOf = (s) => (s.held && typeof s.held === 'object' ? s.held : (s.held = {}));
-
-    /**
-     * 睡着时来消息，被吵醒的概率：基础 5%，每多一条 +10%，像急事 +25%，主人 +5%；
-     * 后半夜睡得沉、快起床时睡得浅；睡前越累睡得越死；心情好更愿意起来理人，心情差更不想理。最高 85%。
-     */
-
-  return { bedtime, ensureEnergy, addEnergy, energyPrompt, moodNudge, refreshWeather, tickTimedItems, tickLifeRecaps };
+  return { bedtime, ensureEnergy, energyNow, addEnergy, energyPrompt, moodNudge, refreshWeather, tickTimedItems, tickLifeRecaps };
 }

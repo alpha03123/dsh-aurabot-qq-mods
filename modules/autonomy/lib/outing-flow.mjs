@@ -332,5 +332,5 @@ export function createOutingFlow({
       return true;
     }
 
-  return { placesOf, pickPlace, rememberVisit, fetchPlacePhoto, sendOutingPhoto, tickPendingShare, goOut, writeOutingStory, finishOuting };
+  return { outingFile, placesOf, pickPlace, rememberVisit, fetchPlacePhoto, sendOutingPhoto, tickPendingShare, goOut, writeOutingStory, finishOuting };
 }
