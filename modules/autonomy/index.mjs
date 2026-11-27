@@ -452,29 +452,52 @@ export default {
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     };
 
-    /** 最近和主人的私聊（从聊天流水读，不进她的会话）：since 之后最多 limit 句 */
+    /** 最近和主人的私聊（从聊天流水读，不进她的会话）：since 之后最多 limit 句，带月-日 时:分 */
     function ownerChatLines(sinceMs, limit = 10) {
       const h = hub();
       const { qq, name } = ownerOf();
       if (!h || typeof h.chatLogOf !== 'function' || !qq) return [];
       const now = Date.now();
-      const days = ymd(sinceMs) === ymd(now) ? [ymd(now)] : [ymd(sinceMs), ymd(now)];
+      const days = [];
+      const cur = new Date(Math.min(sinceMs, now));
+      cur.setHours(0, 0, 0, 0);
+      const endYmd = ymd(now);
+      for (let i = 0; i < 5; i += 1) {
+        const dStr = ymd(cur.getTime());
+        days.push(dStr);
+        if (dStr >= endYmd) break;
+        cur.setDate(cur.getDate() + 1);
+      }
       const rows = [];
       for (const day of days) {
         for (const r of h.chatLogOf(day) || []) {
           if (!r || r.chatId !== `private:${qq}` || r.forgottenAt || !(r.t >= sinceMs)) continue;
           if (r.who === '系统') continue;
-          rows.push(`${fmtHM(r.t)} ${r.who === 'bot' ? '你' : name}：${clip(r.text, 80)}`);
+          rows.push(`[${fmtMDHM(r.t)}] ${r.who === 'bot' ? '你' : name}：${clip(r.text, 80)}`);
         }
       }
       return rows.slice(-limit);
     }
     const fmtHM = (ts) => new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false });
+    const fmtMDHM = (ts) => {
+      const d = new Date(ts);
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return `${mm}-${dd} ${fmtHM(ts)}`;
+    };
 
-    /** 和主人最近一次来往（他说的或她说的） */
+    /** 和主人最近一次来往（他说的或她说的；重启后回退读今天流水） */
     const lastOwnerContact = () => {
       const h = hub();
-      return h ? Math.max(Number(h.lastOwnerChatAt) || 0, Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0) : 0;
+      let t = h ? Math.max(Number(h.lastOwnerChatAt) || 0, Number(h.lastBotToOwner && h.lastBotToOwner.at) || 0) : 0;
+      const { qq } = ownerOf();
+      if (!t && h && typeof h.chatLogOf === 'function' && qq) {
+        const chatId = `private:${qq}`;
+        for (const r of h.chatLogOf(ymd(Date.now())) || []) {
+          if (r && r.chatId === chatId && !r.forgottenAt && r.who !== '系统' && Number(r.t) > t) t = Number(r.t);
+        }
+      }
+      return t;
     };
 
     /**
@@ -497,8 +520,10 @@ export default {
         if ((Number(s.agenda.speaks) || 0) >= SPEAK_MAX_PER_DAY) return { ok: false, note: `今天已经主动找过他 ${s.agenda.speaks} 次了，先不找` };
       }
       const topic = clip(what, 80) + (why ? `（${clip(why, 40)}）` : '');
-      // 安排是早上（甚至前一天）写的：开口前给她现在的时间和天气，话题里的「今天/明天」以现在为准
-      const factLine = `（现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}${s.weather && s.weather.now ? '；天气：' + weatherLine(s.weather) : ''}。话题是早些时候想的，跟现在的事实对不上（比如说明天下雨、其实明天是晴天）就改口或者干脆不提。）`;
+      // 安排是早上（甚至前一天）写的：开口前给她现在的时间、天气与最近私聊（带日期时间戳），话题里的「今天/明天」以现在为准
+      const recentChat = ownerChatLines(Date.now() - 48 * 3600_000, 4);
+      const chatSnap = recentChat.length ? `\n最近私聊：\n${recentChat.join('\n')}` : '';
+      const factLine = `（现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}${s.weather && s.weather.now ? '；天气：' + weatherLine(s.weather) : ''}。话题是早些时候想的，跟现在的事实对不上（比如说明天下雨、其实明天是晴天）就改口或者干脆不提。${chatSnap}）`;
       const prompt = timed && lateFrom && !followup
         ? `【系统提醒，不是${name}说的话】你答应过${name}在 ${fmtHM(lateFrom)} 「${topic}」，可那会儿你不在（睡着了 / 没上线），现在才想起来。用你自己的口气补一句，可以带点不好意思，一两句就好，别提系统。`
         : followup
@@ -995,13 +1020,14 @@ export default {
       const mbti = currentMbti();
       const style = MBTI_STYLE[mbti] || MBTI_STYLE.INFP;
       const mood = moodLine();
-      const chat = ownerChatLines(Date.now() - 24 * 3600_000, 12);
+      const chat = ownerChatLines(Date.now() - 48 * 3600_000, 10);
       const carries = y && Array.isArray(y.carries) ? y.carries.filter((x) => x.from !== 'promise') : [];
       const promised = a.items.filter((x) => x.from === 'promise' && x.state === 'todo');
-      // 想起相关的事：拿昨天的安排、没做完的、答应主人的、正在弄的去搜
-      const memHints = await recallHints(6, [y && y.theme, ...(y && Array.isArray(y.items) ? y.items.map((x) => x.what) : []), ...carries.map((x) => x.what), ...promised.map((x) => x.what), s.project && s.project.name].filter(Boolean));
+      // 想起相关的事：拿近期真实私聊、没做完的、答应主人的、正在弄的去搜（不拿昨天已完成小事反搜自己）
+      const memHints = await recallHints(6, [...carries.map((x) => x.what), ...promised.map((x) => x.what), s.project && s.project.name, ...chat.slice(-4)].filter(Boolean));
       const timers = (s.timers || []).filter((t) => t && !t.fired && !t.dropped);
-      const stateText = (x) => (x.state === 'done' ? '做了' : x.state === 'dropped' ? '划掉了' : '没做') + (x.note ? '：' + x.note : '');
+      const yDoneTitles = y && Array.isArray(y.items) ? y.items.filter((x) => x && x.state === 'done' && x.what).map((x) => x.what) : [];
+      const yDropped = y && Array.isArray(y.items) ? y.items.filter((x) => x && x.state === 'dropped' && x.what).map((x) => `${x.what}${x.note ? `（${clip(x.note, 24)}）` : ''}`) : [];
       // 今天第一次醒是几点：补排（定计划失败过、手动 /plan）时她早就起来了，别再说「刚醒」「睡到现在才起」
       const doneAts = (s.done || []).map((x) => Number(x.at) || 0).filter((t) => t > 0);
       const firstWakeAt = doneAts.length ? Math.min(...doneAts) : Date.now();
@@ -1028,8 +1054,8 @@ export default {
           d0.setHours(from, 0, 0, 0);
           return firstWakeAt - d0.getTime() > 90 * 60_000 && new Date(firstWakeAt).getHours() < 15 ? `你今天睡到 ${clock(firstWakeAt)} 才起，比平时晚。` : '';
         })(),
-        ...(y ? y.items.map((x) => `- ${SLOT_LABEL[x.slot] || ''} · ${x.what} —— ${stateText(x)}`) : []),
-        y && y.done.length ? `昨天实际做过（最近几件）：${y.done.slice(0, 6).map((x) => `${clock(x.at)} ${x.note || x.action}`).join('；')}` : '',
+        yDoneTitles.length ? `昨天做过的（简记，已做完的今天不用接着翻炒）：${yDoneTitles.slice(0, 8).join('、')}` : '',
+        yDropped.length ? `昨天划掉的：${yDropped.slice(0, 4).join('；')}` : '',
         findingsBlock(s),
         carries.length ? `昨天没做完的：${carries.map((x) => x.what).join('、')}。还想做就写进今天，不想做就算了。这些是昨天写的，里面的「明天」「今晚」指的是昨天说的时候，搬到今天要换成今天的说法；跟天气有关的先对一下下面的天气，已经不成立的就别搬。` : '',
         promised.length ? `答应${owner}的事已经排上了，不用再写：${promised.map((x) => `${SLOT_LABEL[x.slot]} ${x.what}`).join('、')}` : '',
@@ -1267,10 +1293,8 @@ export default {
       const softBlocked = softLeft <= 0;
       const hardMissing = kinds.learn + kinds.build === 0 && (s.done || []).filter((x) => !x.dry).length >= 3;
       const plan = agendaBlock(s.agenda, { hour, timers: s.timers });
-      // 上次醒来之后和主人聊了什么（最多往回看三小时）：聊天能改安排
-      const lastWakeAt = (s.done && s.done[0] && Number(s.done[0].at)) || 0;
-      const chatSince = Math.max(Date.now() - 3 * 3600_000, lastWakeAt);
-      const chatLines = ownerChatLines(chatSince, 8);
+      // 最近 48 小时和主人的真实私聊（带日期时间戳），不按上次醒来时间截断
+      const chatLines = ownerChatLines(Date.now() - 48 * 3600_000, 8);
       const ownerName = ownerOf().name;
       const replansLeft = Math.max(0, REPLAN_MAX_PER_DAY - (Number(s.agenda.replans) || 0));
       const brokenList = Object.keys(s.fails.until || {}).filter((k) => brokenNow(s, k) && !moduleMissing(k));
@@ -1314,7 +1338,7 @@ export default {
             ].filter(Boolean).join('\n')
           : `【现在】这会儿没排事${upNext ? `（下一条是 ${clock(upNext.at)} 的「${upNext.what}」）` : '（今天排的都过了）'}，${focus ? `这段「${focus.what}」是你留给自己的空闲，` : ''}想干嘛都行，歇着也行。`,
         chatLines.length
-          ? `【上次醒来之后你和${ownerName}聊过】\n${chatLines.join('\n')}\n聊到的事如果影响今天（他说今晚忙、你们约了什么、他提到想看的东西），就改一下安排。`
+          ? `【和${ownerName}的最近私聊】\n${chatLines.join('\n')}`
           : '',
         '',
         '【你是谁】',

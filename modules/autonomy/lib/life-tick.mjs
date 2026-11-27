@@ -141,26 +141,18 @@ export function createLifeTick({
         .slice(0, 5)
         .reverse()
         .map((x) => `${clock(x.at)} ${clip(x.note || x.brief || x.action, 80)}`);
-      const canShare = canReachOwnerNow(s);
-      const ownerName = ownerOf().name;
       const text = [
         `现在是 ${new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' })} ${clock()}，你刚忙完：${item.what}（${clock(startAt)} 开始${item.why ? `，当时想的是：${item.why}` : ''}）。`,
         before.length ? `这之前做过：\n${before.join('\n')}` : '',
         styleHint(c),
         '',
         '用第一人称写一两句这件事做得怎么样（像跟自己说，不是汇报），50 字以内：成没成、结果怎样、一个具体的小细节（细节要自然写实、符合生活常识，别编奇怪或夸张的物理细节）。顺便写一句忙完之后现在挂在自己 Discord 状态栏上的小状态（15字以内，用你自己的口气，可带1个小emoji）。',
-        canShare
-          ? `如果这件事做得特别开心、有趣或翻车了，你真有冲动顺手跟${ownerName}显摆或吐槽一句，就在 share 里写一句想聊什么；普通例行小事（比如普通吃顿饭）不用每件都报备，share 留空字符串。`
-          : '',
-        canShare
-          ? '只输出 JSON：{"note":"做得怎么样","status":"现在的状态栏短句","share":"想顺手跟他说什么（不想说就空字符串）"}'
-          : '只输出 JSON：{"note":"做得怎么样","status":"现在的状态栏短句"}',
+        '只输出 JSON：{"note":"做得怎么样","status":"现在的状态栏短句"}',
       ]
         .filter((x) => x !== '')
         .join('\n');
       let recap = '';
       let nextStatus = '';
-      let wantShare = '';
       try {
         const out = await ask(api.dsh, { key: 'life-recap', cfg: api.config(),
           system: '你是一个有自己生活的角色，刚忙完一件事。只输出 JSON。',
@@ -172,7 +164,6 @@ export function createLifeTick({
         const j = parseJsonLoose(out);
         recap = clip((j && j.note) || '', 60);
         nextStatus = clip((j && j.status) || '', 36);
-        wantShare = canShare ? clip((j && j.share) || '', 80) : '';
       } catch (error) {
         api.log.warn('自主生活：写生活小结失败 ' + error.message);
       }
@@ -192,17 +183,6 @@ export function createLifeTick({
       } catch (error) {}
       if (recap) appendLog({ at: now, action: 'life-recap', why: item.what, detail: '', note: recap, agendaId: item.id });
       api.log.info(`自主生活：${item.what} 忙完了${recap ? ' —— ' + recap : ''}`);
-      if (wantShare && canReachOwnerNow(s)) {
-        try {
-          const r = await reachOwner(s, { what: wantShare, why: `刚忙完「${item.what}」${recap ? `：${recap}` : ''}` });
-          if (r && r.ok) {
-            appendLog({ at: Date.now(), action: 'speak', why: `刚忙完「${item.what}」顺手分享`, detail: wantShare, note: r.note, agendaId: item.id });
-            api.log.info(`自主生活：忙完「${item.what}」后顺手找主人聊了 —— ${clip(wantShare, 40)}`);
-          }
-        } catch (error) {
-          api.log.warn('自主生活：忙完后顺手找主人失败 ' + error.message);
-        }
-      }
       return true;
     }
 
