@@ -7,7 +7,7 @@ import { readJson, writeJson } from './helpers.mjs';
 
 export function createOutingFlow({
   api, cfg, ask, save, clock, dayKey, ownerOf, hub, appendLog,
-  canReachOwnerNow, canShareImage, isAwakeHour, reachOwner, styleHint, moodNudge, energyPrompt,
+  canReachOwnerNow, canShareImage, isAwakeHour, outingReady, reachOwner, styleHint, moodNudge, energyPrompt,
 }) {
     // ── 出门 ──────────────────────────────────────────
     const outingFile = () => path.join(api.dataDir(), 'outing.json');

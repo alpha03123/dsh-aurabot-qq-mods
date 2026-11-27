@@ -718,6 +718,7 @@ export default {
       api, cfg, ask, save, clock, dayKey, ownerOf, hub, appendLog,
       canReachOwnerNow, canShareImage,
       isAwakeHour: (...a) => isAwakeHour(...a),
+      outingReady: (...a) => outingReady(...a),
       reachOwner,
       styleHint: (...a) => styleHint(...a),
       moodNudge: (...a) => moodNudge(...a),
